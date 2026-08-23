@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asaxs-app"
+version = "0.1.0"
+description = "ASAXS q-space decomposition + IFT → partial PDDFs"
+requires-python = ">=3.11"
+dependencies = [
+    "PyQt6",
+    "pyqtgraph",
+    "numpy",
+    "scipy",
+    "xraylib",
+]
+
+[project.optional-dependencies]
+hdf = ["h5py"]
+
+[project.scripts]
+asaxs-app = "asaxs_app.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
