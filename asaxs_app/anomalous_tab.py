@@ -64,6 +64,7 @@ class AnomalousTab(QWidget):
         self._energies: np.ndarray = np.array([])
         self._fp:  np.ndarray = np.array([])
         self._fpp: np.ndarray = np.array([])
+        self._preset_map: dict = {}   # label → (Z, shell)
         self._build_ui()
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -75,7 +76,8 @@ class AnomalousTab(QWidget):
         form = QFormLayout(ctrl)
 
         self._combo_preset = QComboBox()
-        self._combo_preset.addItems(['(custom)'] + list(_COMMON.keys()))
+        self._combo_preset.addItem('(custom)')
+        self._combo_preset.addItems(list(_COMMON.keys()))
         self._combo_preset.currentIndexChanged.connect(self._on_preset)
         form.addRow('Preset:', self._combo_preset)
 
@@ -131,11 +133,71 @@ class AnomalousTab(QWidget):
     def _on_preset(self, idx):
         if idx == 0:
             return
-        name  = self._combo_preset.currentText()
-        Z     = _COMMON[name]
+        name = self._combo_preset.currentText()
+        if name in self._preset_map:
+            Z, shell = self._preset_map[name]
+        elif name in _COMMON:
+            Z = _COMMON[name]
+            shell = 'L3' if Z > 50 else 'K'
+        else:
+            return
         self._spin_Z.setValue(Z)
-        shell = 'L3' if Z > 50 else 'K'
         self._combo_shell.setCurrentText(shell)
+
+    def _update_presets(self):
+        """Rebuild preset list: edges within (or just outside) the data energy range."""
+        if not _HAS_XRAYDB or len(self._energies) == 0:
+            return
+        e_min, e_max = float(self._energies.min()), float(self._energies.max())
+        margin = 0.3  # keV — include edges slightly outside the scan range
+
+        candidates = []
+        for Z in range(10, 93):
+            try:
+                sym = xraydb.atomic_symbol(Z)
+            except Exception:
+                continue
+            for shell in _SHELLS:
+                e_edge = _edge_energy_keV(Z, shell)
+                if e_edge <= 0:
+                    continue
+                if not (e_min - margin <= e_edge <= e_max + margin):
+                    continue
+                above = int(np.sum(self._energies > e_edge))
+                below = int(np.sum(self._energies < e_edge))
+                # Score: prefer edges well-bracketed by data on both sides
+                score = min(above, below)
+                label = f'{sym} ({Z}) — {shell}  [{e_edge:.4f} keV]'
+                candidates.append((score, Z, shell, label))
+
+        # Best bracketing first, then by Z
+        candidates.sort(key=lambda x: (-x[0], x[1]))
+
+        self._preset_map = {label: (Z, shell) for _, Z, shell, label in candidates}
+
+        self._combo_preset.blockSignals(True)
+        self._combo_preset.clear()
+        self._combo_preset.addItem('(custom)')
+        if candidates:
+            for _, Z, shell, label in candidates:
+                self._combo_preset.addItem(label)
+        else:
+            # Fallback: no edges found in range — keep static list
+            self._combo_preset.addItems(list(_COMMON.keys()))
+        self._combo_preset.blockSignals(False)
+
+        # Auto-select the best candidate (highest score)
+        if candidates:
+            self._combo_preset.setCurrentIndex(1)
+            # Trigger Z/shell update without emitting fp_fpp
+            _, Z, shell, _ = candidates[0]
+            self._spin_Z.blockSignals(True)
+            self._combo_shell.blockSignals(True)
+            self._spin_Z.setValue(Z)
+            self._combo_shell.setCurrentText(shell)
+            self._spin_Z.blockSignals(False)
+            self._combo_shell.blockSignals(False)
+            self._update_edge_label()
 
     def _update_edge_label(self):
         e = _edge_energy_keV(self._spin_Z.value(), self._combo_shell.currentText())
@@ -174,6 +236,7 @@ class AnomalousTab(QWidget):
     # ── Public API ────────────────────────────────────────────────────────────
     def set_energies(self, energies: list[float]):
         self._energies = np.array([e for e in energies if e is not None])
+        self._update_presets()
 
     def get_fp_fpp(self) -> tuple[np.ndarray, np.ndarray] | None:
         if len(self._fp) == len(self._energies) and len(self._fp) > 0:
