@@ -121,7 +121,7 @@ class DataTab(QWidget):
         splitter.addWidget(right)
         splitter.setSizes([420, 580])
 
-        lay.addWidget(splitter)
+        lay.addWidget(splitter, 1)
 
         # ── Signal connections ────────────────────────────────────────────────
         self._btn_add.clicked.connect(self._add_files)
