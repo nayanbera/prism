@@ -292,25 +292,47 @@ class RSpaceTab(QWidget):
         self._rho_r_xdata: np.ndarray | None = None
 
         rd_split.addWidget(right_w)
-        rd_split.setSizes([1, 1])
+
+        # Third panel: core size distribution P(R) = -dρ_R/dr
+        pR_w = QWidget()
+        pR_lay = QVBoxLayout(pR_w)
+        pR_lay.setContentsMargins(2, 2, 2, 2)
+        self._pw_pR = pg.PlotWidget(title='Core size distribution  P(R) = −dρ_R/dr')
+        self._pw_pR.setLabel('bottom', 'R (Å)')
+        self._pw_pR.setLabel('left', 'P(R)  (normalised)')
+        self._pw_pR.addItem(pg.InfiniteLine(
+            pos=0, angle=0, pen=pg.mkPen('gray', width=0.7)))
+        self._pw_pR.addLegend()
+        self._curve_pR     = self._pw_pR.plot([], [], pen=pg.mkPen('#4CAF50', width=2),
+                                               name='P(R)')
+        self._curve_pR_fit = self._pw_pR.plot(
+            [], [],
+            pen=pg.mkPen('white', width=1.5,
+                         style=pg.QtCore.Qt.PenStyle.DashLine),
+            name='lognormal fit')
+        self._coord_lbl_pR = QLabel()
+        self._coord_lbl_pR.setStyleSheet('font-family: monospace; color: #555555;')
+        pR_lay.addWidget(self._pw_pR, 1)
+        pR_lay.addWidget(self._coord_lbl_pR)
+        rd_split.addWidget(pR_w)
+
+        rd_split.setSizes([1, 1, 1])
 
         rdlay.addWidget(rd_split, 1)
 
         tabs.addTab(rdw, 'Resonant ρ(r)')
 
-        self._coord_lbl = QLabel()
-        self._coord_lbl.setStyleSheet('font-family: monospace; color: #555555;')
         lay.addWidget(tabs)
-        lay.addWidget(self._coord_lbl)
 
         # ── Crosshairs ────────────────────────────────────────────────────────
         self._ch = [
-            add_crosshair(self._pw_wf,    label=self._coord_lbl),
-            add_crosshair(self._pw_pr,    label=self._coord_lbl),
-            add_crosshair(self._pw_fit,   label=self._coord_lbl),
-            add_crosshair(self._pw_stuhr, label=self._coord_lbl),
+            add_crosshair(self._pw_wf),
+            add_crosshair(self._pw_pr),
+            add_crosshair(self._pw_fit),
+            add_crosshair(self._pw_stuhr),
             add_crosshair(self._pw_gamma, label=self._coord_lbl_gamma),
             add_crosshair(self._pw_rho,   label=self._coord_lbl_rho),
+            add_crosshair(self._pw_pR,    label=self._coord_lbl_pR),
         ]
 
     # ── Run ───────────────────────────────────────────────────────────────────
@@ -588,16 +610,13 @@ class RSpaceTab(QWidget):
             r_lim = float(r[-1])
         self._pw_gamma.setXRange(0, r_lim, padding=0.02)
 
-        # R_g of resonant component
+        # R_g of resonant component (label updated later with lognormal info)
         norm = np.trapezoid(p_RR, r)
         if norm > 1e-30:
             Rg2 = np.trapezoid(r**2 * p_RR, r) / (2.0 * norm)
-            Rg  = float(np.sqrt(max(Rg2, 0.0)))
-            self._lbl_rg.setText(
-                f'R_g (resonant element) = {Rg:.2f} Å    '
-                f'(R_g > R_g_total → shell; R_g < R_g_total → core)')
+            _Rg = float(np.sqrt(max(Rg2, 0.0)))
         else:
-            self._lbl_rg.setText('R_g (resonant element) — insufficient signal')
+            _Rg = None
 
         # ── Option 3: ρ_R(r) via signed F_R ─────────────────────────────────
         # Back-transform p_MM and p_RM to a fine q grid.
@@ -650,6 +669,55 @@ class RSpaceTab(QWidget):
         self._rho_r_xdata = r_show
         self._replot_rho()
         self._pw_rho.setXRange(0, float(r_show[-1]), padding=0.02)
+
+        # ── Size distribution P(R) = -d(ρ_R_norm)/dr ─────────────────────────
+        P_R = -np.gradient(rho_R, r_show)
+        P_R = np.maximum(P_R, 0.0)
+        norm_P = float(np.trapezoid(P_R, r_show))
+        if norm_P > 0:
+            P_R = P_R / norm_P
+
+        self._curve_pR.setData(r_show, P_R)
+        self._pw_pR.setXRange(0, float(r_show[-1]), padding=0.02)
+
+        # Fit lognormal to P(R)
+        _ln_info = ''
+        try:
+            from scipy.optimize import curve_fit
+
+            def _lnpdf(r, mu, sigma):
+                r = np.maximum(r, 1e-10)
+                return (np.exp(-(np.log(r) - mu)**2 / (2 * sigma**2))
+                        / (r * sigma * np.sqrt(2 * np.pi)))
+
+            mask = (r_show > 0.5) & (P_R > 1e-3 * P_R.max())
+            if mask.sum() > 6:
+                r_peak = float(r_show[np.argmax(P_R)])
+                popt, _ = curve_fit(
+                    _lnpdf, r_show[mask], P_R[mask],
+                    p0=[np.log(max(r_peak, 1.0)), 0.3],
+                    bounds=([0.01, 0.01], [np.log(1e4), 2.0]),
+                    maxfev=5000)
+                mu_f, sig_f = popt
+                R_mean = np.exp(mu_f + sig_f**2 / 2)
+                R_std  = R_mean * np.sqrt(np.exp(sig_f**2) - 1)
+                self._curve_pR_fit.setData(r_show, _lnpdf(r_show, mu_f, sig_f))
+                _ln_info = (f'\nCore radius:  R̅ = {R_mean:.1f} Å,  '
+                            f'σ = {R_std:.1f} Å  (lognormal)')
+            else:
+                self._curve_pR_fit.setData([], [])
+        except Exception:
+            self._curve_pR_fit.setData([], [])
+
+        # Update R_g label with both R_g and lognormal fit info
+        if _Rg is not None:
+            self._lbl_rg.setText(
+                f'R_g (resonant element) = {_Rg:.2f} Å    '
+                f'(R_g > R_g_total → shell; R_g < R_g_total → core)'
+                + _ln_info)
+        else:
+            self._lbl_rg.setText('R_g (resonant element) — insufficient signal'
+                                 + _ln_info)
 
     def _replot_rho(self):
         if self._rho_r_norm is None:
