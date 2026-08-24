@@ -534,39 +534,37 @@ class RSpaceTab(QWidget):
         I_RM_bt = 4.0 * np.pi * (sinc @ p_RM) * dr         # (Nq,)
 
         # I_MM_bt can go negative at high q due to IFT regularisation artefacts.
-        # Clip to 1% of its maximum before taking the sqrt to avoid blowing up F_R.
+        # Clip to 0.1% of peak to avoid blowing up F_R.
         I_MM_floor = 1e-3 * float(np.max(np.abs(I_MM_bt)))
         I_MM_safe  = np.maximum(I_MM_bt, I_MM_floor)
 
         # F_R(q) = I_RM(q) / √I_MM(q) — sign of I_RM carries the sign of F_R
-        # (assumes F_M(q) > 0, i.e. positive square root for the matrix amplitude)
         F_R = I_RM_bt / np.sqrt(I_MM_safe)
 
-        # Weight by a Hanning window in q to suppress Fourier ringing
+        # Hanning window in q to suppress Fourier ringing
         F_R *= np.hanning(len(q_bt))
 
-        # ρ_R(r) = (1/2π²) ∫ F_R(q) q² sinc(qr) dq
-        # Use only the r range that makes physical sense: 0 … D_max/2
-        # (D_max is the maximum pair distance; particle radius ≤ D_max/2)
-        Dmax  = float(r[-1])
-        r_half = r[r <= Dmax / 2]
-        if len(r_half) == 0:
-            r_half = r
+        # ρ_R(r) on the same r range already chosen for γ_RR (r ≤ r_lim).
+        # This avoids pyqtgraph's kÅ SI-prefix re-scaling that hides the signal
+        # when the x-range exceeds ~500 Å.
+        r_show = r[r <= r_lim]
+        if len(r_show) < 3:
+            r_show = r[:max(3, len(r) // 4)]
 
-        sinc_half = np.where(
-            np.abs(np.outer(q_bt, r_half)) < 1e-8, 1.0,
-            np.sin(np.outer(q_bt, r_half)) / np.outer(q_bt, r_half))
+        qr_show = np.outer(q_bt, r_show)
+        sinc_show = np.where(np.abs(qr_show) < 1e-8, 1.0,
+                             np.sin(qr_show) / qr_show)
 
-        rho_R = (1.0 / (2.0 * np.pi**2)) * (sinc_half.T @ (F_R * q_bt**2)) * dq
+        rho_R = (1.0 / (2.0 * np.pi**2)) * (sinc_show.T @ (F_R * q_bt**2)) * dq
 
         # Normalise to max |ρ_R| = 1 for display
-        peak = float(np.max(np.abs(rho_R)))
+        finite = rho_R[np.isfinite(rho_R)]
+        peak   = float(np.max(np.abs(finite))) if finite.size > 0 else 1.0
         if peak > 1e-30:
-            rho_R /= peak
+            rho_R = np.where(np.isfinite(rho_R), rho_R / peak, 0.0)
 
-        self._curve_rho.setData(r_half, rho_R)
-        # Match x-range to γ_RR plot for easy comparison
-        self._pw_rho.setXRange(0, float(r_half[-1]), padding=0.02)
+        self._curve_rho.setData(r_show, rho_R)
+        self._pw_rho.setXRange(0, float(r_show[-1]), padding=0.02)
 
     # ── Public API ────────────────────────────────────────────────────────────
     def set_data(self, q: np.ndarray, I_matrix: np.ndarray,
