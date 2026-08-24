@@ -1,5 +1,5 @@
 # q(1/A)  I_MM(cm-1)  I_RM(cm-1)  I_RR(cm-1)
-#   R_core=55.0A (monodisperse), R_total=220.0A, phi=1.00e-04
+#   Au core / SiO2 shell in water — monodisperse
 3.000000e-03 4.967486e+01 1.220879e-01 3.000603e-04
 3.023406e-03 4.961698e+01 1.220115e-01 3.000347e-04
 3.046995e-03 4.955825e+01 1.219340e-01 3.000087e-04
