@@ -30,6 +30,7 @@ class RSpaceTab(QWidget):
         self._fpp: np.ndarray | None      = None
         self._energies: list[float]       = []
         self._result: dict | None         = None
+        self._q_used: np.ndarray | None   = None
         self._wf_curves: list             = []
         self._build_ui()
 
@@ -190,6 +191,47 @@ class RSpaceTab(QWidget):
         self._stuhr_items: list = []
         tabs.addTab(stw, 'Stuhrmann')
 
+        # Tab 5: resonant element density
+        rdw = QWidget()
+        rdlay = QVBoxLayout(rdw)
+
+        # Option 1: γ_RR(r) = p_RR(r)/r²
+        self._pw_gamma = pg.PlotWidget(
+            title='γ_RR(r) = p_RR(r)/r²  — resonant-element density autocorrelation')
+        self._pw_gamma.setLabel('bottom', 'r (Å)')
+        self._pw_gamma.setLabel('left', 'γ_RR(r)  (arb.)')
+        self._pw_gamma.addItem(pg.InfiniteLine(
+            pos=0, angle=0, pen=pg.mkPen('gray', width=0.7)))
+        self._pw_gamma.addLegend()
+        self._curve_gamma   = self._pw_gamma.plot([], [], pen=pg.mkPen('#F44336', width=2),
+                                                   name='γ_RR(r)')
+        self._band_gamma_up = pg.PlotDataItem(pen=None)
+        self._band_gamma_lo = pg.PlotDataItem(pen=None)
+        self._pw_gamma.addItem(self._band_gamma_up)
+        self._pw_gamma.addItem(self._band_gamma_lo)
+        self._band_gamma_fb = pg.FillBetweenItem(
+            self._band_gamma_up, self._band_gamma_lo,
+            brush=pg.mkBrush('#F4433640'))
+        self._pw_gamma.addItem(self._band_gamma_fb)
+        self._lbl_rg = QLabel()
+        rdlay.addWidget(self._pw_gamma, 1)
+        rdlay.addWidget(self._lbl_rg)
+
+        # Option 3: ρ_R(r) via signed amplitude F_R(q) = I_RM(q)/√I_MM(q)
+        self._pw_rho = pg.PlotWidget(
+            title='ρ_R(r) — resonant element density profile  '
+                  '[F_R(q) = I_RM / √I_MM, back-transform]')
+        self._pw_rho.setLabel('bottom', 'r (Å)')
+        self._pw_rho.setLabel('left', 'ρ_R(r)  (arb.)')
+        self._pw_rho.addItem(pg.InfiniteLine(
+            pos=0, angle=0, pen=pg.mkPen('gray', width=0.7)))
+        self._pw_rho.addLegend()
+        self._curve_rho = self._pw_rho.plot([], [], pen=pg.mkPen('#FF9800', width=2),
+                                             name='ρ_R(r)')
+        rdlay.addWidget(self._pw_rho, 1)
+
+        tabs.addTab(rdw, 'Resonant ρ(r)')
+
         lay.addWidget(tabs)
 
     # ── Run ───────────────────────────────────────────────────────────────────
@@ -240,11 +282,13 @@ class RSpaceTab(QWidget):
             self._lbl_status.setText(f'Error: {e}')
             raise
 
-        self._result = result
+        self._result  = result
+        self._q_used  = q_use
         self._update_pr_waterfall()
         self._update_partial_pr(result)
         self._update_backtransform(result)
         self._update_stuhrmann()
+        self._update_resonant_density(result)
         self.rspace_done.emit(result)
         self._lbl_status.setText(
             f'Done — D_max={Dmax:.0f} Å, N_r={Nr}, '
@@ -435,6 +479,65 @@ class RSpaceTab(QWidget):
             f'p_MM = {res["p_MM"][mid_j]:.4g}   '
             f'p_RM = {res["p_RM"][mid_j]:.4g}   '
             f'p_RR = {res["p_RR"][mid_j]:.4g}  cm⁻¹ Å⁻¹')
+
+    def _update_resonant_density(self, res: dict):
+        """
+        Option 1: γ_RR(r) = p_RR(r) / r²  — resonant density autocorrelation.
+        Option 3: ρ_R(r) estimated by back-transforming p_MM, p_RM to q-space,
+                  computing signed amplitude F_R(q) = I_RM(q) / √I_MM(q),
+                  then IFT of F_R to real space.
+        """
+        r    = res['r']
+        p_MM = res['p_MM'];  p_RM = res['p_RM'];  p_RR = res['p_RR']
+        sp_RR = res['sp_RR']
+        dr = r[1] - r[0]
+
+        # ── Option 1: γ_RR(r) ────────────────────────────────────────────────
+        r2   = np.maximum(r**2, (dr / 2)**2)   # avoid /0 at r≈0
+        gam  = p_RR  / r2
+        sgam = sp_RR / r2
+
+        self._curve_gamma.setData(r, gam)
+        self._band_gamma_up.setData(r, gam + sgam)
+        self._band_gamma_lo.setData(r, gam - sgam)
+
+        # R_g of resonant component
+        norm = np.trapz(p_RR, r)
+        if norm > 1e-30:
+            Rg2 = np.trapz(r**2 * p_RR, r) / (2.0 * norm)
+            Rg  = float(np.sqrt(max(Rg2, 0.0)))
+            self._lbl_rg.setText(
+                f'R_g (resonant element) = {Rg:.2f} Å    '
+                f'(R_g > R_g_total → shell; R_g < R_g_total → core)')
+        else:
+            self._lbl_rg.setText('R_g (resonant element) — insufficient signal')
+
+        # ── Option 3: ρ_R(r) via signed F_R ─────────────────────────────────
+        # Back-transform p_MM and p_RM to a fine q grid.
+        # I_XX(q) = 4π ∫ p_XX(r) sinc(qr) dr
+        q_max = float(self._q_used.max()) if self._q_used is not None else 0.5
+        q_bt  = np.linspace(1e-3, q_max, 600)
+        dq    = q_bt[1] - q_bt[0]
+
+        qr    = np.outer(q_bt, r)                           # (Nq, Nr)
+        sinc  = np.where(np.abs(qr) < 1e-8, 1.0, np.sin(qr) / qr)
+
+        I_MM_bt = 4.0 * np.pi * (sinc @ p_MM) * dr         # (Nq,)
+        I_RM_bt = 4.0 * np.pi * (sinc @ p_RM) * dr         # (Nq,)
+
+        # F_R(q) = I_RM(q) / √I_MM(q)  — sign of I_RM carries sign of F_R
+        # (assumes F_M > 0, i.e. positive square root for the matrix amplitude)
+        F_R = I_RM_bt / np.sqrt(np.maximum(I_MM_bt, 1e-60))
+
+        # ρ_R(r) = (1/2π²) ∫ F_R(q) q² sinc(qr) dq
+        rho_R = (1.0 / (2.0 * np.pi**2)) * (sinc.T @ (F_R * q_bt**2)) * dq
+
+        # Normalise to max |ρ_R| = 1 for display
+        peak = np.max(np.abs(rho_R))
+        if peak > 1e-30:
+            rho_R /= peak
+
+        self._curve_rho.setData(r, rho_R)
 
     # ── Public API ────────────────────────────────────────────────────────────
     def set_data(self, q: np.ndarray, I_matrix: np.ndarray,
