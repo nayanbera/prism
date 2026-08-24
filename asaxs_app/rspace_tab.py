@@ -191,13 +191,21 @@ class RSpaceTab(QWidget):
         self._stuhr_items: list = []
         tabs.addTab(stw, 'Stuhrmann')
 
-        # Tab 5: resonant element density
+        # Tab 5: resonant element density — two plots side by side
         rdw = QWidget()
         rdlay = QVBoxLayout(rdw)
+        rdlay.setContentsMargins(0, 0, 0, 0)
 
-        # Option 1: γ_RR(r) = p_RR(r)/r²
+        from PyQt6.QtWidgets import QSplitter
+        rd_split = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left panel: γ_RR(r) + R_g label
+        left_w = QWidget()
+        left_lay = QVBoxLayout(left_w)
+        left_lay.setContentsMargins(2, 2, 2, 2)
+
         self._pw_gamma = pg.PlotWidget(
-            title='γ_RR(r) = p_RR(r)/r²  — resonant-element density autocorrelation')
+            title='γ_RR(r) = p_RR(r)/r²')
         self._pw_gamma.setLabel('bottom', 'r (Å)')
         self._pw_gamma.setLabel('left', 'γ_RR(r)  (arb.)')
         self._pw_gamma.addItem(pg.InfiniteLine(
@@ -214,22 +222,24 @@ class RSpaceTab(QWidget):
             brush=pg.mkBrush('#F4433640'))
         self._pw_gamma.addItem(self._band_gamma_fb)
         self._lbl_rg = QLabel()
-        rdlay.addWidget(self._pw_gamma, 1)
-        rdlay.addWidget(self._lbl_rg)
+        left_lay.addWidget(self._pw_gamma, 1)
+        left_lay.addWidget(self._lbl_rg)
+        rd_split.addWidget(left_w)
 
-        # Option 3: ρ_R(r) via signed amplitude F_R(q) = I_RM(q)/√I_MM(q)
+        # Right panel: ρ_R(r)
         self._pw_rho = pg.PlotWidget(
-            title='ρ_R(r) — resonant element density profile  '
-                  '[F_R(q) = I_RM / √I_MM, back-transform]')
+            title='ρ_R(r) — resonant element radial density profile')
         self._pw_rho.setLabel('bottom', 'r (Å)')
-        self._pw_rho.setLabel('left', 'ρ_R(r)  (arb.)')
+        self._pw_rho.setLabel('left', 'ρ_R(r)  (arb., normalised)')
         self._pw_rho.addItem(pg.InfiniteLine(
             pos=0, angle=0, pen=pg.mkPen('gray', width=0.7)))
         self._pw_rho.addLegend()
         self._curve_rho = self._pw_rho.plot([], [], pen=pg.mkPen('#FF9800', width=2),
                                              name='ρ_R(r)')
-        rdlay.addWidget(self._pw_rho, 1)
+        rd_split.addWidget(self._pw_rho)
+        rd_split.setSizes([1, 1])
 
+        rdlay.addWidget(rd_split, 1)
         tabs.addTab(rdw, 'Resonant ρ(r)')
 
         lay.addWidget(tabs)
@@ -557,9 +567,12 @@ class RSpaceTab(QWidget):
 
         rho_R = (1.0 / (2.0 * np.pi**2)) * (sinc_show.T @ (F_R * q_bt**2)) * dq
 
-        # Normalise to max |ρ_R| = 1 for display
+        # Physical constraint: density ≥ 0; clip negative artefacts from limited q range
+        rho_R = np.maximum(rho_R, 0.0)
+
+        # Normalise to peak = 1 for display
         finite = rho_R[np.isfinite(rho_R)]
-        peak   = float(np.max(np.abs(finite))) if finite.size > 0 else 1.0
+        peak   = float(np.max(finite)) if finite.size > 0 else 1.0
         if peak > 1e-30:
             rho_R = np.where(np.isfinite(rho_R), rho_R / peak, 0.0)
 
