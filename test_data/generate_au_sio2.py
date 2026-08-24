@@ -25,7 +25,7 @@ OUT_DIR = Path(__file__).parent / "au_sio2"
 # ── Parameters ────────────────────────────────────────────────────────────────
 R_CORE    = 55.0    # Å  mean Au-core radius
 R_TOTAL   = 220.0   # Å  mean total outer radius (core + silica shell)
-SIGMA_REL = 0.05    # 5% relative lognormal width (σ_R / R̄)
+SIGMA_REL = 0.20    # 20% relative lognormal width (σ_R / R̄)
 N_ENERGIES = 20     # number of ASAXS energy points
 E_MIN     = 10.919  # keV
 E_MAX     = 11.919  # keV  (Au L3 edge)
@@ -54,7 +54,7 @@ P_R      = (np.exp(-(np.log(R_vals) - mu_ln)**2 / (2*sigma_ln**2))
 P_R     /= np.trapezoid(P_R, R_vals)   # normalise to ∫P dR = 1
 
 # ── q grid ────────────────────────────────────────────────────────────────────
-q = np.geomspace(0.002, 0.25, 200)   # Å⁻¹
+q = np.geomspace(0.003, 0.145, 500)  # Å⁻¹
 
 # ── Form-factor helpers ───────────────────────────────────────────────────────
 def sphere_f0(q, R):
