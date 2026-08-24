@@ -118,9 +118,12 @@ class IFTTab(QWidget):
         self._fit_curves: list = []
         tabs.addTab(self._pw_fit, 'Back-transform')
 
-        self._ch = [add_crosshair(self._pw_pr),
-                    add_crosshair(self._pw_fit)]
+        self._coord_lbl = QLabel()
+        self._coord_lbl.setStyleSheet('font-family: monospace; color: #555555;')
+        self._ch = [add_crosshair(self._pw_pr,  label=self._coord_lbl),
+                    add_crosshair(self._pw_fit, label=self._coord_lbl)]
         lay.addWidget(tabs)
+        lay.addWidget(self._coord_lbl)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _run(self):

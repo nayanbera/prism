@@ -209,10 +209,13 @@ class DecompositionTab(QWidget):
 
         inner.addTab(stw, 'Stuhrmann')
 
-        self._ch = [add_crosshair(self._pw_iq),
-                    add_crosshair(self._pw_wf),
-                    add_crosshair(self._pw_stuhr)]
+        self._coord_lbl = QLabel()
+        self._coord_lbl.setStyleSheet('font-family: monospace; color: #555555;')
+        self._ch = [add_crosshair(self._pw_iq,    label=self._coord_lbl),
+                    add_crosshair(self._pw_wf,     label=self._coord_lbl),
+                    add_crosshair(self._pw_stuhr,  label=self._coord_lbl)]
         lay.addWidget(inner)
+        lay.addWidget(self._coord_lbl)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _run(self):

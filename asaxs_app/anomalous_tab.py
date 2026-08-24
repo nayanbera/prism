@@ -126,8 +126,15 @@ class AnomalousTab(QWidget):
         plots.addWidget(self._pw_fpp)
 
         lay.addLayout(plots)
-        self._ch = [add_crosshair(self._pw_fp, x_fmt='.4f', y_fmt='.3f'),
-                    add_crosshair(self._pw_fpp, x_fmt='.4f', y_fmt='.3f')]
+
+        self._coord_lbl = QLabel()
+        self._coord_lbl.setStyleSheet('font-family: monospace; color: #555555;')
+        lay.addWidget(self._coord_lbl)
+
+        self._ch = [add_crosshair(self._pw_fp,  x_fmt='.4f', y_fmt='.3f',
+                                  label=self._coord_lbl),
+                    add_crosshair(self._pw_fpp, x_fmt='.4f', y_fmt='.3f',
+                                  label=self._coord_lbl)]
         self._update_edge_label()
         self._spin_Z.valueChanged.connect(self._update_edge_label)
         self._combo_shell.currentIndexChanged.connect(self._update_edge_label)

@@ -119,12 +119,16 @@ class DataTab(QWidget):
         self._pw.setLogMode(x=False, y=True)
         right_lay.addWidget(self._pw)
 
+        self._coord_lbl = QLabel()
+        self._coord_lbl.setStyleSheet('font-family: monospace; color: #aaaaaa;')
+        right_lay.addWidget(self._coord_lbl)
+
         splitter.addWidget(right)
         splitter.setSizes([420, 580])
 
         lay.addWidget(splitter, 1)
 
-        self._ch = [add_crosshair(self._pw)]
+        self._ch = [add_crosshair(self._pw, label=self._coord_lbl)]
 
         # ── Signal connections ────────────────────────────────────────────────
         self._btn_add.clicked.connect(self._add_files)

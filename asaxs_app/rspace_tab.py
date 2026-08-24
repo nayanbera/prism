@@ -278,16 +278,19 @@ class RSpaceTab(QWidget):
 
         tabs.addTab(rdw, 'Resonant ρ(r)')
 
+        self._coord_lbl = QLabel()
+        self._coord_lbl.setStyleSheet('font-family: monospace; color: #555555;')
         lay.addWidget(tabs)
+        lay.addWidget(self._coord_lbl)
 
         # ── Crosshairs ────────────────────────────────────────────────────────
         self._ch = [
-            add_crosshair(self._pw_wf),
-            add_crosshair(self._pw_pr),
-            add_crosshair(self._pw_fit),
-            add_crosshair(self._pw_stuhr),
-            add_crosshair(self._pw_gamma),
-            add_crosshair(self._pw_rho),
+            add_crosshair(self._pw_wf,    label=self._coord_lbl),
+            add_crosshair(self._pw_pr,    label=self._coord_lbl),
+            add_crosshair(self._pw_fit,   label=self._coord_lbl),
+            add_crosshair(self._pw_stuhr, label=self._coord_lbl),
+            add_crosshair(self._pw_gamma, label=self._coord_lbl),
+            add_crosshair(self._pw_rho,   label=self._coord_lbl),
         ]
 
     # ── Run ───────────────────────────────────────────────────────────────────
