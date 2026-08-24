@@ -9,6 +9,7 @@ from .decomposition_tab import DecompositionTab
 from .rspace_tab import RSpaceTab
 from .ift_tab import IFTTab
 from .export_tab import ExportTab
+from .sim_data_tab import SimDataTab
 
 
 class MainWindow(QMainWindow):
@@ -26,6 +27,7 @@ class MainWindow(QMainWindow):
         self._rspace_tab  = RSpaceTab()
         self._ift_tab     = IFTTab()
         self._export_tab  = ExportTab()
+        self._sim_tab     = SimDataTab()
 
         tabs.addTab(self._data_tab,   '1 · Data')
         tabs.addTab(self._anom_tab,   '2 · Anomalous factors')
@@ -33,6 +35,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._rspace_tab, '4 · r-space decomp')
         tabs.addTab(self._ift_tab,    '5 · IFT (q-first)')
         tabs.addTab(self._export_tab, '6 · Export')
+        tabs.addTab(self._sim_tab,    '7 · Sim data')
 
         self._status = QStatusBar()
         self.setStatusBar(self._status)
