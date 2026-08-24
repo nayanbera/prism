@@ -7,9 +7,10 @@ Difference mode — subtract reference energy E_ref → I_RM, I_RR only
 """
 
 import numpy as np
+from pathlib import Path
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QPushButton,
-    QLabel, QCheckBox, QSplitter, QComboBox, QTabWidget,
+    QLabel, QCheckBox, QSplitter, QComboBox, QTabWidget, QFileDialog,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 import pyqtgraph as pg
@@ -31,6 +32,12 @@ class DecompositionTab(QWidget):
         np.ndarray,   # σ_MM
         np.ndarray,   # σ_RM
         np.ndarray,   # σ_RR
+    )
+    reference_loaded = pyqtSignal(
+        np.ndarray,   # q
+        np.ndarray,   # I_MM
+        np.ndarray,   # I_RM
+        np.ndarray,   # I_RR
     )
 
     def __init__(self, parent=None):
@@ -87,6 +94,9 @@ class DecompositionTab(QWidget):
         top.addWidget(self._chk_errbar)
 
         top.addStretch()
+        self._btn_ref = QPushButton('Load reference partials…')
+        self._btn_ref.clicked.connect(self._load_reference)
+        top.addWidget(self._btn_ref)
         self._lbl_status = QLabel('Load data and compute f\'/f\'\' first')
         top.addWidget(self._lbl_status)
         lay.addLayout(top)
@@ -111,6 +121,13 @@ class DecompositionTab(QWidget):
             self._pw_iq.addItem(ei)
             self._err_items[name] = ei
         self._raw_curves: list = []
+        # Dashed reference overlay — populated by _load_reference()
+        self._ref_iq_curves: dict[str, pg.PlotDataItem] = {}
+        for name, col in _COLORS.items():
+            self._ref_iq_curves[name] = self._pw_iq.plot(
+                [], [], name=f'{name} ref',
+                pen=pg.mkPen(col, width=1.5,
+                             style=pg.QtCore.Qt.PenStyle.DashLine))
         inner.addTab(self._pw_iq, 'Partial I(q)')
 
         # ── Waterfall plot ────────────────────────────────────────────────────
@@ -216,6 +233,22 @@ class DecompositionTab(QWidget):
                     add_crosshair(self._pw_stuhr,  label=self._coord_lbl)]
         lay.addWidget(inner)
         lay.addWidget(self._coord_lbl)
+
+    def _load_reference(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Load reference partials (q  I_MM  I_RM  I_RR)', '',
+            'Data files (*.dat *.txt);;All files (*)')
+        if not path:
+            return
+        try:
+            data = np.loadtxt(path, comments='#')
+            q_ref, I_MM, I_RM, I_RR = data[:, 0], data[:, 1], data[:, 2], data[:, 3]
+            for name, arr in [('I_MM', I_MM), ('I_RM', np.abs(I_RM)), ('I_RR', I_RR)]:
+                self._ref_iq_curves[name].setData(q_ref, arr)
+            self.reference_loaded.emit(q_ref, I_MM, I_RM, I_RR)
+            self._lbl_status.setText(f'Reference: {Path(path).name}')
+        except Exception as e:
+            self._lbl_status.setText(f'Reference load error: {e}')
 
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _run(self):

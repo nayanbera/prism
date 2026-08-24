@@ -162,6 +162,9 @@ class RSpaceTab(QWidget):
         self._pw_wf.setLabel('bottom', 'r (Å)')
         self._pw_wf.setLabel('left', 'p(r, E)')
         wflay.addWidget(self._pw_wf)
+        self._coord_lbl_wf = QLabel()
+        self._coord_lbl_wf.setStyleSheet('font-family: monospace; color: #555555;')
+        wflay.addWidget(self._coord_lbl_wf)
         tabs.addTab(wfw, 'p(r, E) waterfall')
 
         # Tab 2: partial p(r)
@@ -186,7 +189,14 @@ class RSpaceTab(QWidget):
             self._upper_pr[name] = up
             self._lower_pr[name] = lo
             self._bands_pr[name] = fb
-        tabs.addTab(self._pw_pr, 'Partial p(r)')
+        prw = QWidget()
+        prlay = QVBoxLayout(prw)
+        prlay.setContentsMargins(0, 0, 0, 0)
+        prlay.addWidget(self._pw_pr)
+        self._coord_lbl_pr = QLabel()
+        self._coord_lbl_pr.setStyleSheet('font-family: monospace; color: #555555;')
+        prlay.addWidget(self._coord_lbl_pr)
+        tabs.addTab(prw, 'Partial p(r)')
 
         # Tab 3: back-transform
         self._pw_fit = pg.PlotWidget(title='Back-transform: K·p(r) vs I(q)')
@@ -195,7 +205,21 @@ class RSpaceTab(QWidget):
         self._pw_fit.setLogMode(x=False, y=True)
         self._pw_fit.addLegend()
         self._fit_curves: list = []
-        tabs.addTab(self._pw_fit, 'Back-transform')
+        # Reference partial overlays (dashed) — populated by set_reference_partials()
+        self._ref_bt_curves: dict = {}
+        for _n, _c in _COLORS.items():
+            self._ref_bt_curves[_n] = self._pw_fit.plot(
+                [], [], name=f'{_n} ref',
+                pen=pg.mkPen(_c, width=1.5,
+                             style=pg.QtCore.Qt.PenStyle.DashLine))
+        fitw = QWidget()
+        fitlay = QVBoxLayout(fitw)
+        fitlay.setContentsMargins(0, 0, 0, 0)
+        fitlay.addWidget(self._pw_fit)
+        self._coord_lbl_fit = QLabel()
+        self._coord_lbl_fit.setStyleSheet('font-family: monospace; color: #555555;')
+        fitlay.addWidget(self._coord_lbl_fit)
+        tabs.addTab(fitw, 'Back-transform')
 
         # Tab 4: r-space Stuhrmann
         stw = QWidget()
@@ -223,6 +247,9 @@ class RSpaceTab(QWidget):
 
         self._lbl_stuhr_r = QLabel()
         slay.addWidget(self._lbl_stuhr_r)
+        self._coord_lbl_stuhr = QLabel()
+        self._coord_lbl_stuhr.setStyleSheet('font-family: monospace; color: #555555;')
+        slay.addWidget(self._coord_lbl_stuhr)
 
         self._stuhr_items: list = []
         tabs.addTab(stw, 'Stuhrmann')
@@ -326,10 +353,10 @@ class RSpaceTab(QWidget):
 
         # ── Crosshairs ────────────────────────────────────────────────────────
         self._ch = [
-            add_crosshair(self._pw_wf),
-            add_crosshair(self._pw_pr),
-            add_crosshair(self._pw_fit),
-            add_crosshair(self._pw_stuhr),
+            add_crosshair(self._pw_wf,    label=self._coord_lbl_wf),
+            add_crosshair(self._pw_pr,    label=self._coord_lbl_pr),
+            add_crosshair(self._pw_fit,   label=self._coord_lbl_fit),
+            add_crosshair(self._pw_stuhr, label=self._coord_lbl_stuhr),
             add_crosshair(self._pw_gamma, label=self._coord_lbl_gamma),
             add_crosshair(self._pw_rho,   label=self._coord_lbl_rho),
             add_crosshair(self._pw_pR,    label=self._coord_lbl_pR),
@@ -734,6 +761,12 @@ class RSpaceTab(QWidget):
             self._rho_ref_line.setValue(1.0)
             self._rho_ref_line.setVisible(True)
         self._curve_rho.setData(self._rho_r_xdata, y)
+
+    def set_reference_partials(self, q: np.ndarray, I_MM: np.ndarray,
+                               I_RM: np.ndarray, I_RR: np.ndarray):
+        """Overlay ground-truth reference partials on the Back-transform plot."""
+        for name, arr in [('p_MM', I_MM), ('p_RM', np.abs(I_RM)), ('p_RR', I_RR)]:
+            self._ref_bt_curves[name].setData(q, arr)
 
     # ── Public API ────────────────────────────────────────────────────────────
     def set_data(self, q: np.ndarray, I_matrix: np.ndarray,

@@ -41,6 +41,7 @@ class MainWindow(QMainWindow):
         self._data_tab.datasets_changed.connect(self._on_datasets_changed)
         self._anom_tab.fp_fpp_ready.connect(self._on_fp_fpp)
         self._decomp_tab.decomposition_done.connect(self._on_decomposition_done)
+        self._decomp_tab.reference_loaded.connect(self._rspace_tab.set_reference_partials)
         self._ift_tab.ift_done.connect(self._on_ift_done)
         self._rspace_tab.rspace_done.connect(self._on_rspace_done)
 
