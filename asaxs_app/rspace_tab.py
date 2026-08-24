@@ -41,7 +41,8 @@ class RSpaceTab(QWidget):
 
         # ── Controls ──────────────────────────────────────────────────────────
         ctrl = QGroupBox('IFT parameters (shared across all energies)')
-        cform = QFormLayout(ctrl)
+        ctrl_lay = QHBoxLayout(ctrl)
+        cform = QFormLayout()
 
         self._spin_dmax = QDoubleSpinBox()
         self._spin_dmax.setRange(10, 10000)
@@ -108,6 +109,40 @@ class RSpaceTab(QWidget):
         btn_row.addWidget(self._lbl_status)
         btn_row.addStretch()
         cform.addRow(btn_row)
+
+        ctrl_lay.addLayout(cform)
+
+        # Right panel inside ctrl: R_g readout + ρ_R scale
+        right_ctrl = QVBoxLayout()
+        right_ctrl.setContentsMargins(12, 0, 0, 0)
+
+        self._lbl_rg = QLabel('R_g (resonant element): —')
+        self._lbl_rg.setWordWrap(True)
+        right_ctrl.addWidget(self._lbl_rg)
+
+        scale_hrow = QHBoxLayout()
+        scale_hrow.addWidget(QLabel('ρ_R peak density scale:'))
+        self._spin_rho_scale = QDoubleSpinBox()
+        self._spin_rho_scale.setDecimals(4)
+        self._spin_rho_scale.setRange(0, 1e6)
+        self._spin_rho_scale.setValue(0.0)
+        self._spin_rho_scale.setSpecialValueText('Normalised (max = 1)')
+        self._spin_rho_scale.setFixedWidth(160)
+        self._spin_rho_scale.setToolTip(
+            '0 = normalised to max=1.\n'
+            'Set to the expected peak density (e.g. 0.0469 e⁻/Å³ for bulk Au)\n'
+            'to convert the ρ_R y-axis — requires absolute I(q).')
+        self._spin_rho_scale.valueChanged.connect(self._replot_rho)
+        scale_hrow.addWidget(self._spin_rho_scale)
+        scale_hrow.addStretch()
+        right_ctrl.addLayout(scale_hrow)
+
+        scale_note = QLabel('[0 = shape only;  set bulk density (e.g. 0.0469 e⁻/Å³ for Au) for abs. units]')
+        scale_note.setWordWrap(True)
+        right_ctrl.addWidget(scale_note)
+
+        right_ctrl.addStretch()
+        ctrl_lay.addLayout(right_ctrl)
 
         lay.addWidget(ctrl)
 
@@ -222,9 +257,10 @@ class RSpaceTab(QWidget):
             self._band_gamma_up, self._band_gamma_lo,
             brush=pg.mkBrush('#F4433640'))
         self._pw_gamma.addItem(self._band_gamma_fb)
-        self._lbl_rg = QLabel()
+        self._coord_lbl_gamma = QLabel()
+        self._coord_lbl_gamma.setStyleSheet('font-family: monospace; color: #555555;')
         left_lay.addWidget(self._pw_gamma, 1)
-        left_lay.addWidget(self._lbl_rg)
+        left_lay.addWidget(self._coord_lbl_gamma)
         rd_split.addWidget(left_w)
 
         # Right panel: ρ_R(r)
@@ -246,7 +282,10 @@ class RSpaceTab(QWidget):
             pen=pg.mkPen('cyan', style=pg.QtCore.Qt.PenStyle.DashLine, width=1),
             label='bulk ref', labelOpts={'color': 'cyan', 'position': 0.9})
         self._pw_rho.addItem(self._rho_ref_line)
+        self._coord_lbl_rho = QLabel()
+        self._coord_lbl_rho.setStyleSheet('font-family: monospace; color: #555555;')
         right_lay.addWidget(self._pw_rho, 1)
+        right_lay.addWidget(self._coord_lbl_rho)
 
         # Store normalised rho_R for rescaling without recomputing
         self._rho_r_norm: np.ndarray | None = None
@@ -256,25 +295,6 @@ class RSpaceTab(QWidget):
         rd_split.setSizes([1, 1])
 
         rdlay.addWidget(rd_split, 1)
-
-        # Peak density scale row — below both plots, full width
-        scale_row = QHBoxLayout()
-        self._spin_rho_scale = QDoubleSpinBox()
-        self._spin_rho_scale.setDecimals(4)
-        self._spin_rho_scale.setRange(0, 1e6)
-        self._spin_rho_scale.setValue(0.0)
-        self._spin_rho_scale.setSpecialValueText('Normalised (max = 1)')
-        self._spin_rho_scale.setFixedWidth(160)
-        self._spin_rho_scale.setToolTip(
-            '0 = normalised to max=1.\n'
-            'Set to the expected peak density (e.g. 0.0469 e⁻/Å³ for bulk Au)\n'
-            'to convert the ρ_R y-axis — requires absolute I(q).')
-        self._spin_rho_scale.valueChanged.connect(self._replot_rho)
-        scale_row.addWidget(QLabel('ρ_R peak density scale:'))
-        scale_row.addWidget(self._spin_rho_scale)
-        scale_row.addWidget(QLabel(' [0 = shape only;  set bulk density (e.g. 0.0469 e⁻/Å³ for Au) for abs. units]'))
-        scale_row.addStretch()
-        rdlay.addLayout(scale_row)
 
         tabs.addTab(rdw, 'Resonant ρ(r)')
 
@@ -289,8 +309,8 @@ class RSpaceTab(QWidget):
             add_crosshair(self._pw_pr,    label=self._coord_lbl),
             add_crosshair(self._pw_fit,   label=self._coord_lbl),
             add_crosshair(self._pw_stuhr, label=self._coord_lbl),
-            add_crosshair(self._pw_gamma, label=self._coord_lbl),
-            add_crosshair(self._pw_rho,   label=self._coord_lbl),
+            add_crosshair(self._pw_gamma, label=self._coord_lbl_gamma),
+            add_crosshair(self._pw_rho,   label=self._coord_lbl_rho),
         ]
 
     # ── Run ───────────────────────────────────────────────────────────────────
