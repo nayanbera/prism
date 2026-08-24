@@ -500,6 +500,14 @@ class RSpaceTab(QWidget):
         self._curve_gamma.setData(r, gam)
         self._band_gamma_up.setData(r, gam + sgam)
         self._band_gamma_lo.setData(r, gam - sgam)
+        # Zoom to the region where γ_RR > 1% of peak (where signal lives)
+        peak_gam = float(np.max(gam)) if gam.size > 0 else 1.0
+        if peak_gam > 0:
+            r_sig = r[gam >= 0.01 * peak_gam]
+            r_lim = float(r_sig[-1]) * 1.1 if r_sig.size > 0 else float(r[-1])
+        else:
+            r_lim = float(r[-1])
+        self._pw_gamma.setXRange(0, r_lim, padding=0.02)
 
         # R_g of resonant component
         norm = np.trapz(p_RR, r)
@@ -519,25 +527,46 @@ class RSpaceTab(QWidget):
         q_bt  = np.linspace(1e-3, q_max, 600)
         dq    = q_bt[1] - q_bt[0]
 
-        qr    = np.outer(q_bt, r)                           # (Nq, Nr)
-        sinc  = np.where(np.abs(qr) < 1e-8, 1.0, np.sin(qr) / qr)
+        qr   = np.outer(q_bt, r)                            # (Nq, Nr)
+        sinc = np.where(np.abs(qr) < 1e-8, 1.0, np.sin(qr) / qr)
 
         I_MM_bt = 4.0 * np.pi * (sinc @ p_MM) * dr         # (Nq,)
         I_RM_bt = 4.0 * np.pi * (sinc @ p_RM) * dr         # (Nq,)
 
-        # F_R(q) = I_RM(q) / √I_MM(q)  — sign of I_RM carries sign of F_R
-        # (assumes F_M > 0, i.e. positive square root for the matrix amplitude)
-        F_R = I_RM_bt / np.sqrt(np.maximum(I_MM_bt, 1e-60))
+        # I_MM_bt can go negative at high q due to IFT regularisation artefacts.
+        # Clip to 1% of its maximum before taking the sqrt to avoid blowing up F_R.
+        I_MM_floor = 1e-3 * float(np.max(np.abs(I_MM_bt)))
+        I_MM_safe  = np.maximum(I_MM_bt, I_MM_floor)
+
+        # F_R(q) = I_RM(q) / √I_MM(q) — sign of I_RM carries the sign of F_R
+        # (assumes F_M(q) > 0, i.e. positive square root for the matrix amplitude)
+        F_R = I_RM_bt / np.sqrt(I_MM_safe)
+
+        # Weight by a Hanning window in q to suppress Fourier ringing
+        F_R *= np.hanning(len(q_bt))
 
         # ρ_R(r) = (1/2π²) ∫ F_R(q) q² sinc(qr) dq
-        rho_R = (1.0 / (2.0 * np.pi**2)) * (sinc.T @ (F_R * q_bt**2)) * dq
+        # Use only the r range that makes physical sense: 0 … D_max/2
+        # (D_max is the maximum pair distance; particle radius ≤ D_max/2)
+        Dmax  = float(r[-1])
+        r_half = r[r <= Dmax / 2]
+        if len(r_half) == 0:
+            r_half = r
+
+        sinc_half = np.where(
+            np.abs(np.outer(q_bt, r_half)) < 1e-8, 1.0,
+            np.sin(np.outer(q_bt, r_half)) / np.outer(q_bt, r_half))
+
+        rho_R = (1.0 / (2.0 * np.pi**2)) * (sinc_half.T @ (F_R * q_bt**2)) * dq
 
         # Normalise to max |ρ_R| = 1 for display
-        peak = np.max(np.abs(rho_R))
+        peak = float(np.max(np.abs(rho_R)))
         if peak > 1e-30:
             rho_R /= peak
 
-        self._curve_rho.setData(r, rho_R)
+        self._curve_rho.setData(r_half, rho_R)
+        # Match x-range to γ_RR plot for easy comparison
+        self._pw_rho.setXRange(0, float(r_half[-1]), padding=0.02)
 
     # ── Public API ────────────────────────────────────────────────────────────
     def set_data(self, q: np.ndarray, I_matrix: np.ndarray,
