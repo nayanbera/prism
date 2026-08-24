@@ -227,16 +227,50 @@ class RSpaceTab(QWidget):
         rd_split.addWidget(left_w)
 
         # Right panel: ρ_R(r)
+        right_w = QWidget()
+        right_lay = QVBoxLayout(right_w)
+        right_lay.setContentsMargins(2, 2, 2, 2)
+
+        # Scale control: 0 = normalised (max=1); >0 = multiply by this value
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(QLabel('Peak density scale:'))
+        self._spin_rho_scale = QDoubleSpinBox()
+        self._spin_rho_scale.setDecimals(4)
+        self._spin_rho_scale.setRange(0, 1e6)
+        self._spin_rho_scale.setValue(0.0)
+        self._spin_rho_scale.setSpecialValueText('Normalised (max = 1)')
+        self._spin_rho_scale.setToolTip(
+            '0 = normalised to max=1.\n'
+            'Set to the expected peak density (e.g. 0.0469 e⁻/Å³ for bulk Au)\n'
+            'to convert the y-axis to physical units — requires absolute I(q).')
+        self._spin_rho_scale.valueChanged.connect(self._replot_rho)
+        scale_row.addWidget(self._spin_rho_scale)
+        scale_row.addWidget(QLabel('  [0 = shape only; set bulk density for abs. units]'))
+        scale_row.addStretch()
+        right_lay.addLayout(scale_row)
+
         self._pw_rho = pg.PlotWidget(
             title='ρ_R(r) — resonant element radial density profile')
         self._pw_rho.setLabel('bottom', 'r (Å)')
-        self._pw_rho.setLabel('left', 'ρ_R(r)  (arb., normalised)')
+        self._pw_rho.setLabel('left', 'ρ_R(r)  (normalised)')
         self._pw_rho.addItem(pg.InfiniteLine(
             pos=0, angle=0, pen=pg.mkPen('gray', width=0.7)))
         self._pw_rho.addLegend()
         self._curve_rho = self._pw_rho.plot([], [], pen=pg.mkPen('#FF9800', width=2),
                                              name='ρ_R(r)')
-        rd_split.addWidget(self._pw_rho)
+        # Reference line at peak = 1 (bulk)
+        self._rho_ref_line = pg.InfiniteLine(
+            pos=1.0, angle=0,
+            pen=pg.mkPen('cyan', style=pg.QtCore.Qt.PenStyle.DashLine, width=1),
+            label='bulk ref', labelOpts={'color': 'cyan', 'position': 0.9})
+        self._pw_rho.addItem(self._rho_ref_line)
+        right_lay.addWidget(self._pw_rho, 1)
+
+        # Store normalised rho_R for rescaling without recomputing
+        self._rho_r_norm: np.ndarray | None = None
+        self._rho_r_xdata: np.ndarray | None = None
+
+        rd_split.addWidget(right_w)
         rd_split.setSizes([1, 1])
 
         rdlay.addWidget(rd_split, 1)
@@ -576,8 +610,27 @@ class RSpaceTab(QWidget):
         if peak > 1e-30:
             rho_R = np.where(np.isfinite(rho_R), rho_R / peak, 0.0)
 
-        self._curve_rho.setData(r_show, rho_R)
+        # Store normalised profile for scale-spinbox rescaling
+        self._rho_r_norm  = rho_R
+        self._rho_r_xdata = r_show
+        self._replot_rho()
         self._pw_rho.setXRange(0, float(r_show[-1]), padding=0.02)
+
+    def _replot_rho(self):
+        if self._rho_r_norm is None:
+            return
+        scale = self._spin_rho_scale.value()
+        if scale > 0:
+            y = self._rho_r_norm * scale
+            self._pw_rho.setLabel('left', 'ρ_R(r)  (scaled)')
+            self._rho_ref_line.setValue(scale)
+            self._rho_ref_line.setVisible(True)
+        else:
+            y = self._rho_r_norm
+            self._pw_rho.setLabel('left', 'ρ_R(r)  (normalised, max = 1)')
+            self._rho_ref_line.setValue(1.0)
+            self._rho_ref_line.setVisible(True)
+        self._curve_rho.setData(self._rho_r_xdata, y)
 
     # ── Public API ────────────────────────────────────────────────────────────
     def set_data(self, q: np.ndarray, I_matrix: np.ndarray,
