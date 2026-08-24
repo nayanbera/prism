@@ -14,6 +14,7 @@ from PyQt6.QtCore import Qt, pyqtSignal  # noqa: F401
 import pyqtgraph as pg
 
 from .core.ift import ift_then_decompose, _sinc_kernel
+from .core.crosshair import add_crosshair
 
 _COLORS = {'p_MM': '#2196F3', 'p_RM': '#4CAF50', 'p_RR': '#F44336'}
 
@@ -231,24 +232,6 @@ class RSpaceTab(QWidget):
         right_lay = QVBoxLayout(right_w)
         right_lay.setContentsMargins(2, 2, 2, 2)
 
-        # Scale control: 0 = normalised (max=1); >0 = multiply by this value
-        scale_row = QHBoxLayout()
-        scale_row.addWidget(QLabel('Peak density scale:'))
-        self._spin_rho_scale = QDoubleSpinBox()
-        self._spin_rho_scale.setDecimals(4)
-        self._spin_rho_scale.setRange(0, 1e6)
-        self._spin_rho_scale.setValue(0.0)
-        self._spin_rho_scale.setSpecialValueText('Normalised (max = 1)')
-        self._spin_rho_scale.setToolTip(
-            '0 = normalised to max=1.\n'
-            'Set to the expected peak density (e.g. 0.0469 e⁻/Å³ for bulk Au)\n'
-            'to convert the y-axis to physical units — requires absolute I(q).')
-        self._spin_rho_scale.valueChanged.connect(self._replot_rho)
-        scale_row.addWidget(self._spin_rho_scale)
-        scale_row.addWidget(QLabel('  [0 = shape only; set bulk density for abs. units]'))
-        scale_row.addStretch()
-        right_lay.addLayout(scale_row)
-
         self._pw_rho = pg.PlotWidget(
             title='ρ_R(r) — resonant element radial density profile')
         self._pw_rho.setLabel('bottom', 'r (Å)')
@@ -258,7 +241,6 @@ class RSpaceTab(QWidget):
         self._pw_rho.addLegend()
         self._curve_rho = self._pw_rho.plot([], [], pen=pg.mkPen('#FF9800', width=2),
                                              name='ρ_R(r)')
-        # Reference line at peak = 1 (bulk)
         self._rho_ref_line = pg.InfiniteLine(
             pos=1.0, angle=0,
             pen=pg.mkPen('cyan', style=pg.QtCore.Qt.PenStyle.DashLine, width=1),
@@ -274,9 +256,39 @@ class RSpaceTab(QWidget):
         rd_split.setSizes([1, 1])
 
         rdlay.addWidget(rd_split, 1)
+
+        # Peak density scale row — below both plots, full width
+        scale_row = QHBoxLayout()
+        self._spin_rho_scale = QDoubleSpinBox()
+        self._spin_rho_scale.setDecimals(4)
+        self._spin_rho_scale.setRange(0, 1e6)
+        self._spin_rho_scale.setValue(0.0)
+        self._spin_rho_scale.setSpecialValueText('Normalised (max = 1)')
+        self._spin_rho_scale.setFixedWidth(160)
+        self._spin_rho_scale.setToolTip(
+            '0 = normalised to max=1.\n'
+            'Set to the expected peak density (e.g. 0.0469 e⁻/Å³ for bulk Au)\n'
+            'to convert the ρ_R y-axis — requires absolute I(q).')
+        self._spin_rho_scale.valueChanged.connect(self._replot_rho)
+        scale_row.addWidget(QLabel('ρ_R peak density scale:'))
+        scale_row.addWidget(self._spin_rho_scale)
+        scale_row.addWidget(QLabel(' [0 = shape only;  set bulk density (e.g. 0.0469 e⁻/Å³ for Au) for abs. units]'))
+        scale_row.addStretch()
+        rdlay.addLayout(scale_row)
+
         tabs.addTab(rdw, 'Resonant ρ(r)')
 
         lay.addWidget(tabs)
+
+        # ── Crosshairs ────────────────────────────────────────────────────────
+        self._ch = [
+            add_crosshair(self._pw_wf),
+            add_crosshair(self._pw_pr),
+            add_crosshair(self._pw_fit),
+            add_crosshair(self._pw_stuhr),
+            add_crosshair(self._pw_gamma),
+            add_crosshair(self._pw_rho),
+        ]
 
     # ── Run ───────────────────────────────────────────────────────────────────
     def _run(self):

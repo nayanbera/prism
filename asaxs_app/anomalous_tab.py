@@ -15,6 +15,7 @@ except ImportError:
     _HAS_XRAYDB = False
 
 from .core.decompose import build_A, condition_number
+from .core.crosshair import add_crosshair
 
 # xraydb uses string edge names — same as our UI labels
 _SHELLS = ['K', 'L1', 'L2', 'L3', 'M1', 'M2', 'M3', 'M4', 'M5']
@@ -125,6 +126,8 @@ class AnomalousTab(QWidget):
         plots.addWidget(self._pw_fpp)
 
         lay.addLayout(plots)
+        self._ch = [add_crosshair(self._pw_fp, x_fmt='.4f', y_fmt='.3f'),
+                    add_crosshair(self._pw_fpp, x_fmt='.4f', y_fmt='.3f')]
         self._update_edge_label()
         self._spin_Z.valueChanged.connect(self._update_edge_label)
         self._combo_shell.currentIndexChanged.connect(self._update_edge_label)

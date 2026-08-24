@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal
 import pyqtgraph as pg
 
+from .core.crosshair import add_crosshair
 from .core.decompose import (
     decompose, decompose_difference, stuhrmann_analysis, condition_number,
 )
@@ -208,6 +209,9 @@ class DecompositionTab(QWidget):
 
         inner.addTab(stw, 'Stuhrmann')
 
+        self._ch = [add_crosshair(self._pw_iq),
+                    add_crosshair(self._pw_wf),
+                    add_crosshair(self._pw_stuhr)]
         lay.addWidget(inner)
 
     # ── Slots ─────────────────────────────────────────────────────────────────

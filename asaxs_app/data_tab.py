@@ -12,6 +12,7 @@ from PyQt6.QtGui import QColor
 import pyqtgraph as pg
 
 from .core.io import load_file, interpolate_to_common_q
+from .core.crosshair import add_crosshair
 
 
 def _energy_color(t: float) -> tuple[int, int, int]:
@@ -122,6 +123,8 @@ class DataTab(QWidget):
         splitter.setSizes([420, 580])
 
         lay.addWidget(splitter, 1)
+
+        self._ch = [add_crosshair(self._pw)]
 
         # ── Signal connections ────────────────────────────────────────────────
         self._btn_add.clicked.connect(self._add_files)

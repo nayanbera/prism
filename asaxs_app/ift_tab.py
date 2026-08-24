@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal
 import pyqtgraph as pg
 
+from .core.crosshair import add_crosshair
 from .core.ift import ift_all, _sinc_kernel
 
 _COLORS = {'p_MM': '#2196F3', 'p_RM': '#4CAF50', 'p_RR': '#F44336'}
@@ -117,6 +118,8 @@ class IFTTab(QWidget):
         self._fit_curves: list = []
         tabs.addTab(self._pw_fit, 'Back-transform')
 
+        self._ch = [add_crosshair(self._pw_pr),
+                    add_crosshair(self._pw_fit)]
         lay.addWidget(tabs)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
