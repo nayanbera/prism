@@ -510,9 +510,9 @@ class RSpaceTab(QWidget):
         self._pw_gamma.setXRange(0, r_lim, padding=0.02)
 
         # R_g of resonant component
-        norm = np.trapz(p_RR, r)
+        norm = np.trapezoid(p_RR, r)
         if norm > 1e-30:
-            Rg2 = np.trapz(r**2 * p_RR, r) / (2.0 * norm)
+            Rg2 = np.trapezoid(r**2 * p_RR, r) / (2.0 * norm)
             Rg  = float(np.sqrt(max(Rg2, 0.0)))
             self._lbl_rg.setText(
                 f'R_g (resonant element) = {Rg:.2f} Å    '
