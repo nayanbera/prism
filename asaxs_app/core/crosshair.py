@@ -28,7 +28,10 @@ def add_crosshair(pw: pg.PlotWidget, x_fmt: str = '.4g', y_fmt: str = '.4g',
             vline.setPos(pt.x())
             hline.setPos(pt.y())
             if label is not None:
-                label.setText(f'x = {pt.x():{x_fmt}}    y = {pt.y():{y_fmt}}')
+                log_x, log_y = vb.state.get('logMode', [False, False])
+                xv = 10 ** pt.x() if log_x else pt.x()
+                yv = 10 ** pt.y() if log_y else pt.y()
+                label.setText(f'x = {xv:{x_fmt}}    y = {yv:{y_fmt}}')
 
     proxy = pg.SignalProxy(pw.scene().sigMouseMoved, rateLimit=60, slot=_on_move)
     return proxy

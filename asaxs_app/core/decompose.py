@@ -10,6 +10,9 @@ in q-space — doing so causes a spurious dip in I_RR at form-factor
 minima where I_tot → 0 for all energies simultaneously.
 
 Error propagation: Cov(x) = (A^T W A)^{-1}  for the unconstrained WLS.
+
+Multi-element support (N=1..3):
+  partial_names_multi, build_A_multi, condition_number_multi, decompose_multi
 """
 
 import numpy as np
@@ -23,6 +26,33 @@ def build_A(fp: np.ndarray, fpp: np.ndarray) -> np.ndarray:
 
 def condition_number(fp: np.ndarray, fpp: np.ndarray) -> float:
     return float(np.linalg.cond(build_A(fp, fpp)))
+
+
+def cauchy_schwarz_ratio(
+    I_MM: np.ndarray, I_RM: np.ndarray, I_RR: np.ndarray
+) -> np.ndarray:
+    """CS(q) = I_RM² / (|I_MM|·|I_RR|).  Values > 1 violate the physical constraint."""
+    denom = np.abs(I_MM) * np.abs(I_RR)
+    return np.where(denom > 0, I_RM**2 / denom, 0.0)
+
+
+def enforce_cauchy_schwarz(
+    I_MM: np.ndarray, I_RM: np.ndarray, I_RR: np.ndarray
+) -> np.ndarray:
+    """Boost I_RR to I_RM²/|I_MM| where the C-S inequality is violated.
+
+    Rearranges I_RM² ≤ I_MM·I_RR → I_RR ≥ I_RM²/|I_MM|.
+    Adjusting I_RR (the weakest signal) upward is more physical than clamping
+    I_RM — the WLS systematically underestimates I_RR due to its low SNR.
+    Returns the corrected I_RR array.
+    """
+    I_RR_out = I_RR.copy()
+    violated = cauchy_schwarz_ratio(I_MM, I_RM, I_RR) > 1.0
+    if violated.any():
+        denom = np.abs(I_MM[violated])
+        I_RR_out[violated] = np.where(
+            denom > 0, I_RM[violated]**2 / denom, I_RR_out[violated])
+    return I_RR_out
 
 
 def _wls_with_errors(A: np.ndarray, b: np.ndarray, w: np.ndarray
@@ -165,9 +195,12 @@ def stuhrmann_analysis(
 
     kappa = condition_number(fp, fpp)
 
-    # Smooth fit curve over f' range
+    # Smooth fit curve over f' range.
+    # Sort by fp before interpolating: fp is non-monotonic when energies cross
+    # the absorption edge, and np.interp requires increasing xp.
+    _sort   = np.argsort(fp)
     fp_fit  = np.linspace(fp.min(), fp.max(), 200)
-    fpp_fit = np.interp(fp_fit, fp, fpp)
+    fpp_fit = np.interp(fp_fit, fp[_sort], fpp[_sort])
     I0_fit  = I_MM_0 + 2 * fp_fit * I_RM_0 + (fp_fit**2 + fpp_fit**2) * I_RR_0
 
     return dict(
@@ -177,3 +210,70 @@ def stuhrmann_analysis(
         sigma_MM_0=errs[0], sigma_RM_0=errs[1], sigma_RR_0=errs[2],
         kappa=kappa,
     )
+
+
+# ── Multi-element decomposition ───────────────────────────────────────────────
+
+def partial_names_multi(n_elem: int) -> list:
+    """Ordered list of partial structure factor names for N elements.
+    Order: I_MM, I_R1M,..,I_RNM, I_R1R1,..,I_RNRN, I_R1R2,..,I_R(N-1)RN
+    """
+    names = ['I_MM']
+    for i in range(n_elem):
+        names.append(f'I_R{i+1}M')
+    for i in range(n_elem):
+        names.append(f'I_R{i+1}R{i+1}')
+    for i in range(n_elem):
+        for j in range(i+1, n_elem):
+            names.append(f'I_R{i+1}R{j+1}')
+    return names
+
+
+def build_A_multi(elements: list) -> np.ndarray:
+    """Build (N_E, n_cols) design matrix for N resonant elements.
+    elements: list of (fp, fpp) array pairs.
+    Column order matches partial_names_multi().
+    """
+    N_E = len(elements[0][0])
+    cols = [np.ones(N_E)]
+    for fp, fpp in elements:
+        cols.append(2.0 * fp)
+    for fp, fpp in elements:
+        cols.append(fp**2 + fpp**2)
+    for i in range(len(elements)):
+        for j in range(i+1, len(elements)):
+            fp_i, fpp_i = elements[i]
+            fp_j, fpp_j = elements[j]
+            cols.append(2.0 * (fp_i*fp_j + fpp_i*fpp_j))
+    return np.column_stack(cols)
+
+
+def condition_number_multi(elements: list) -> float:
+    return float(np.linalg.cond(build_A_multi(elements)))
+
+
+def decompose_multi(
+    q: np.ndarray,
+    I_matrix: np.ndarray,
+    sigma_matrix: np.ndarray,
+    elements: list,
+) -> dict:
+    """Multi-element direct decomposition.
+    elements: list of (fp, fpp) pairs.
+    Returns dict with keys:
+      'names'    : list of partial names (length n_cols)
+      'partials' : ndarray (n_cols, NQ) — best-fit values
+      'errors'   : ndarray (n_cols, NQ) — 1σ propagated errors
+    """
+    A     = build_A_multi(elements)
+    names = partial_names_multi(len(elements))
+    NQ    = len(q)
+    n_cols = A.shape[1]
+    parts = np.zeros((n_cols, NQ))
+    errs  = np.zeros((n_cols, NQ))
+    for j in range(NQ):
+        sig = np.maximum(sigma_matrix[:, j], 1e-30)
+        sol, e = _wls_with_errors(A, I_matrix[:, j], 1.0 / sig)
+        parts[:, j] = sol
+        errs[:, j]  = e
+    return {'names': names, 'partials': parts, 'errors': errs}

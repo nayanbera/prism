@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QLabel, QSpinBox, QComboBox, QPushButton, QDoubleSpinBox,
     QScrollArea, QSplitter, QTextEdit, QFileDialog, QLineEdit,
-    QRadioButton, QButtonGroup,
+    QRadioButton, QButtonGroup, QCheckBox, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
@@ -64,6 +64,65 @@ _MATERIAL_PRESETS = {
 }
 
 
+# ─── Molecular formula parser ────────────────────────────────────────────────
+
+def _parse_formula(formula: str) -> dict[str, int]:
+    """Parse a molecular formula like 'Ca3(PO4)2' → {'Ca':3,'P':2,'O':8}."""
+    import re
+
+    def _helper(s: str) -> dict[str, int]:
+        result = {}
+        i = 0
+        while i < len(s):
+            if s[i] == '(':
+                j = i + 1; depth = 1
+                while j < len(s) and depth:
+                    if s[j] == '(': depth += 1
+                    elif s[j] == ')': depth -= 1
+                    j += 1
+                inner = _helper(s[i + 1:j - 1])
+                m = re.match(r'\d+', s[j:])
+                mul = int(m.group()) if m else 1
+                j  += len(m.group()) if m else 0
+                for sym, cnt in inner.items():
+                    result[sym] = result.get(sym, 0) + cnt * mul
+                i = j
+            else:
+                m = re.match(r'([A-Z][a-z]?)(\d*)', s[i:])
+                if not m:
+                    raise ValueError(f'Cannot parse formula near: {s[i:]!r}')
+                sym, num = m.group(1), m.group(2)
+                result[sym] = result.get(sym, 0) + (int(num) if num else 1)
+                i += len(m.group())
+        return result
+
+    return _helper(formula.strip())
+
+
+def _formula_to_Mne(formula: str) -> tuple[float, int]:
+    """Return (molar_mass g/mol, total electrons) for a molecular formula string."""
+    if not _HAS_XRAYDB:
+        raise RuntimeError('xraydb not installed — run: pip install xraydb')
+    counts = _parse_formula(formula)
+    M, ne = 0.0, 0
+    for sym, cnt in counts.items():
+        try:
+            ne += xraydb.atomic_number(sym) * cnt
+            M  += xraydb.atomic_mass(sym) * cnt
+        except Exception:
+            raise ValueError(f'Unknown element symbol: {sym!r}')
+    return M, ne
+
+
+def _element_Z(symbol: str) -> int | None:
+    if not _HAS_XRAYDB:
+        return None
+    try:
+        return xraydb.atomic_number(symbol)
+    except Exception:
+        return None
+
+
 # ─── Physics ──────────────────────────────────────────────────────────────────
 
 def _elec_density(rho, M, ne):
@@ -83,6 +142,17 @@ def _sphere_f0_2d(q, R_arr):
 def _sphere_V(R):
     return (4/3) * np.pi * R**3
 
+def _lognormal_grid(mean, sig_rel, n=300):
+    """Grid + weights for a lognormal distribution with given mean and σ_rel."""
+    sln = np.sqrt(np.log(1 + sig_rel**2))
+    mu  = np.log(mean) - sln**2 / 2
+    sR  = mean * sig_rel
+    xv  = np.linspace(max(1.0, mean - 6*sR), mean + 6*sR, n)
+    P   = np.exp(-(np.log(xv) - mu)**2 / (2*sln**2)) / (xv * sln * np.sqrt(2*np.pi))
+    P  /= np.trapz(P, xv)
+    return xv, P
+
+
 def _compute_partials(q, cfg, log):
     core = cfg['core']; shell = cfg['shell']; solv = cfg['solvent']
     rho_c = _elec_density(core['mass_density'], core['molar_mass'], core['n_electrons'])
@@ -90,41 +160,97 @@ def _compute_partials(q, cfg, log):
     rho_v = _elec_density(solv['mass_density'], solv['molar_mass'], solv['n_electrons'])
     V_at  = _atom_volume(core['mass_density'], core['molar_mass'])
     dr_c  = rho_c - rho_v;  dr_s = rho_s - rho_v
-    delta = shell['radius_outer'] - core['radius_mean']
-    sig   = core.get('sigma_rel', 0.0)
+    sig_c = core.get('sigma_rel', 0.0)
+    sig_s = shell.get('sigma_rel', 0.0)
+    Rc0   = core['radius_mean']
+    Rt0   = shell['radius_outer']
+    delta = Rt0 - Rc0
     phi   = cfg['experiment']['volume_fraction']
     log(f'  ρ_core={rho_c:.4f}  ρ_shell={rho_s:.4f}  ρ_solv={rho_v:.4f} e/Å³')
 
-    if sig == 0.0:
-        Rc = core['radius_mean']; Rt = shell['radius_outer']
-        Vc = _sphere_V(Rc); Vt = _sphere_V(Rt)
-        f0c = _sphere_f0_1d(q, Rc); f0t = _sphere_f0_1d(q, Rt)
+    if sig_c == 0.0 and sig_s == 0.0:
+        # ── Fully monodisperse ────────────────────────────────────────────────
+        Vc = _sphere_V(Rc0); Vt = _sphere_V(Rt0)
+        f0c = _sphere_f0_1d(q, Rc0); f0t = _sphere_f0_1d(q, Rt0)
         Fn = (dr_c - dr_s) * Vc * f0c + dr_s * Vt * f0t
         Fr = Vc / V_at * f0c
         I_MM_r, I_RM_r, I_RR_r = Fn**2, Fn*Fr, Fr**2
         Vp = Vt;  log('  Mode: monodisperse')
-    else:
-        sln = np.sqrt(np.log(1 + sig**2))
-        mu  = np.log(core['radius_mean']) - sln**2 / 2
-        sR  = core['radius_mean'] * sig
-        Rv  = np.linspace(max(1.0, core['radius_mean'] - 6*sR), core['radius_mean'] + 6*sR, 600)
-        PR  = np.exp(-(np.log(Rv) - mu)**2 / (2*sln**2)) / (Rv * sln * np.sqrt(2*np.pi))
-        PR /= np.trapezoid(PR, Rv)
-        Rt  = Rv + delta
-        Vc  = _sphere_V(Rv); Vt = _sphere_V(Rt)
-        f0c = _sphere_f0_2d(q, Rv); f0t = _sphere_f0_2d(q, Rt)
+
+    elif sig_c > 0.0 and sig_s == 0.0:
+        # ── Polydisperse core, fixed shell thickness ───────────────────────────
+        Rv, PR = _lognormal_grid(Rc0, sig_c, n=600)
+        Rtv = Rv + delta
+        Vc = _sphere_V(Rv); Vt = _sphere_V(Rtv)
+        f0c = _sphere_f0_2d(q, Rv); f0t = _sphere_f0_2d(q, Rtv)
         Fn  = (dr_c - dr_s) * Vc[None,:] * f0c + dr_s * Vt[None,:] * f0t
         Fr  = Vc[None,:] / V_at * f0c
-        I_MM_r = np.trapezoid(PR[None,:] * Fn**2,    Rv, axis=1)
-        I_RM_r = np.trapezoid(PR[None,:] * Fn * Fr,  Rv, axis=1)
-        I_RR_r = np.trapezoid(PR[None,:] * Fr**2,    Rv, axis=1)
+        I_MM_r = np.trapz(PR[None,:] * Fn**2,   Rv, axis=1)
+        I_RM_r = np.trapz(PR[None,:] * Fn * Fr, Rv, axis=1)
+        I_RR_r = np.trapz(PR[None,:] * Fr**2,   Rv, axis=1)
         Vp = np.mean(_sphere_V(Rv + delta))
-        log(f'  Mode: lognormal σ_rel={sig:.2f}')
+        log(f'  Mode: core lognormal σ_rel={sig_c:.2f}')
+
+    elif sig_c == 0.0 and sig_s > 0.0:
+        # ── Monodisperse core, polydisperse R_outer ───────────────────────────
+        # Fr doesn't depend on Rt → I_RR = Fr², I_RM = Fr*<Fn>, I_MM via moments
+        Vc  = _sphere_V(Rc0)
+        f0c = _sphere_f0_1d(q, Rc0)
+        Fr  = Vc / V_at * f0c                              # (NQ,) — constant
+        Fn0 = (dr_c - dr_s) * Vc * f0c                    # (NQ,) core contribution
+
+        Rtv, Ptv = _lognormal_grid(Rt0, sig_s, n=300)
+        # Ensure Rt > Rc (clip distribution below Rc+1)
+        mask = Rtv > Rc0 + 1.0
+        Rtv, Ptv = Rtv[mask], Ptv[mask]
+        Ptv /= np.trapz(Ptv, Rtv)
+
+        Vtv    = _sphere_V(Rtv)                            # (Nt,)
+        f0t    = _sphere_f0_2d(q, Rtv)                    # (NQ, Nt)
+        st     = dr_s * Vtv[None,:] * f0t                 # (NQ, Nt) shell amplitude
+        mean_st    = np.trapz(Ptv[None,:] * st,      Rtv, axis=1)  # (NQ,)
+        mean_st_sq = np.trapz(Ptv[None,:] * st**2,   Rtv, axis=1)  # (NQ,)
+
+        I_MM_r = Fn0**2 + 2*Fn0*mean_st + mean_st_sq
+        I_RM_r = Fr * (Fn0 + mean_st)
+        I_RR_r = Fr**2
+        Vp = np.trapz(Ptv * _sphere_V(Rtv), Rtv)
+        log(f'  Mode: R_outer lognormal σ_rel={sig_s:.2f}')
+
+    else:
+        # ── Both polydisperse — 2-D integral (60 × 60 grid) ──────────────────
+        Rv, PRv = _lognormal_grid(Rc0, sig_c, n=60)
+        Rtv, Ptv = _lognormal_grid(Rt0, sig_s, n=60)
+        # Mask Rt < Rc (unphysical)
+        valid = Rtv > Rv.min() + 1.0
+        Rtv, Ptv = Rtv[valid], Ptv[valid]
+        Ptv /= np.trapz(Ptv, Rtv)
+
+        Vc  = _sphere_V(Rv)                                # (Nv,)
+        Vt  = _sphere_V(Rtv)                               # (Nt,)
+        f0c = _sphere_f0_2d(q, Rv)                        # (NQ, Nv)
+        f0t = _sphere_f0_2d(q, Rtv)                       # (NQ, Nt)
+
+        # Fn[q,i,j] = core_amp[q,i] + shell_amp[q,j]
+        core_amp  = (dr_c - dr_s) * Vc[None,:] * f0c     # (NQ, Nv)
+        shell_amp = dr_s * Vt[None,:] * f0t               # (NQ, Nt)
+        Fn = core_amp[:,:,None] + shell_amp[:,None,:]      # (NQ, Nv, Nt)
+        Fr = (Vc / V_at)[None,:] * f0c                    # (NQ, Nv)  — no Rt dep.
+
+        W = PRv[None,:,None] * Ptv[None,None,:]            # (1, Nv, Nt)
+        I_MM_r = np.trapz(np.trapz(W * Fn**2,         Rtv, axis=2), Rv, axis=1)
+        # I_RM = <Fn * Fr>: Fr has no Nt dep → integrate Fn over Rt first
+        mean_Fn = np.trapz(Ptv[None,None,:] * Fn,     Rtv, axis=2)  # (NQ, Nv)
+        I_RM_r  = np.trapz(PRv[None,:] * mean_Fn * Fr, Rv, axis=1)
+        I_RR_r  = np.trapz(PRv[None,:] * Fr**2,        Rv, axis=1)
+        Vp = np.trapz(Ptv * _sphere_V(Rtv), Rtv)
+        log(f'  Mode: core σ_rel={sig_c:.2f}  R_outer σ_rel={sig_s:.2f}  (2-D grid)')
 
     sc = phi / Vp * 1e24 * (2.818e-13)**2
     return sc * I_MM_r, sc * I_RM_r, sc * I_RR_r
 
 def _select_energies(cfg, log=None):
+    """Single-element wrapper kept for backward compat."""
     exp = cfg['experiment']
     Z = exp['resonant_Z']; E0 = exp['E_min_keV']; E1 = exp['E_max_keV']; N = exp['n_energies']
     Ed   = np.linspace(E0, E1, 3000)
@@ -141,6 +267,50 @@ def _select_energies(cfg, log=None):
         for e, f, ff in zip(Es, fp, fpp):
             log(f'  {e:10.4f}  {f:8.3f}  {ff:8.3f}')
     return Es, fp, fpp
+
+
+def _select_energies_multi(cfg, log=None):
+    """Select energies and compute f'/f'' for all active resonant elements.
+
+    Returns (energies_list, elem_results) where elem_results is a list of
+    {'Z', 'fp', 'fpp', 'scale'} dicts — one per active element.
+    Energies are spaced equidistant in f'(E) for element 1 (primary).
+    """
+    exp      = cfg['experiment']
+    E0, E1, N = exp['E_min_keV'], exp['E_max_keV'], exp['n_energies']
+    elements  = cfg.get('resonant_elements', [{'Z': exp['resonant_Z'], 'scale': 1.0}])
+
+    # Select energies equidistant in Δf' for the primary element
+    Z0  = elements[0]['Z']
+    Ed  = np.linspace(E0, E1, 3000)
+    fpd = np.array([xraydb.f1_chantler(Z0, e*1000) for e in Ed])
+    idx = np.argsort(fpd)
+    tgt = np.linspace(fpd[idx[0]], fpd[idx[-1]], N)
+    Es  = sorted(np.interp(tgt, fpd[idx], Ed[idx]))
+
+    if log:
+        hdrs = ['E (keV)'] + [f"f'_{i+1}" for i in range(len(elements))] + \
+               [f'f"_{i+1}' for i in range(len(elements))]
+        log('  ' + '  '.join(f'{h:>9}' for h in hdrs))
+        log('  ' + '-' * (11 * len(hdrs)))
+
+    elem_results = []
+    fp_table  = []
+    fpp_table = []
+    for elem in elements:
+        Z   = elem['Z']
+        fp  = np.array([xraydb.f1_chantler(Z, e*1000) for e in Es])
+        fpp = np.array([abs(xraydb.f2_chantler(Z, e*1000)) for e in Es])
+        elem_results.append({'Z': Z, 'fp': fp, 'fpp': fpp, 'scale': elem.get('scale', 1.0)})
+        fp_table.append(fp); fpp_table.append(fpp)
+
+    if log:
+        for k, e in enumerate(Es):
+            row = f'  {e:10.4f}' + ''.join(f'  {fp_table[i][k]:8.3f}' for i in range(len(elements))) \
+                                 + ''.join(f'  {fpp_table[i][k]:8.3f}' for i in range(len(elements)))
+            log(row)
+
+    return Es, elem_results
 
 def _make_noise(I_tot, cfg, rng):
     nc = cfg['noise']
@@ -165,23 +335,39 @@ class _GeneratorThread(QThread):
 
     def run(self):
         try:
-            cfg = self._cfg
+            cfg     = self._cfg
             out_dir = Path(cfg['output']['directory'])
             name    = cfg['output'].get('name', 'particle')
             qg      = cfg['q_grid']
             q       = (np.geomspace if qg.get('spacing','log') == 'log' else np.linspace)(
                 qg['q_min'], qg['q_max'], qg['n_points'])
 
-            self.log_line.emit('Computing partial structure factors …')
-            I_MM, I_RM, I_RR = _compute_partials(q, cfg, self.log_line.emit)
-            self.log_line.emit(f'  I_MM(q_min)={I_MM[0]:.3e}  I_RM(q_min)={I_RM[0]:.3e}  I_RR(q_min)={I_RR[0]:.3e} cm⁻¹')
+            self.log_line.emit('Computing partial structure factors (base model) …')
+            I_MM_base, I_RM_base, I_RR_base = _compute_partials(q, cfg, self.log_line.emit)
+            self.log_line.emit(
+                f'  I_MM={I_MM_base[0]:.3e}  I_RM={I_RM_base[0]:.3e}  I_RR={I_RR_base[0]:.3e} cm⁻¹ (at q_min)')
 
-            self.log_line.emit('\nSelecting energies (equidistant Δf′ across range) …')
-            energies, fp_vals, fpp_vals = _select_energies(cfg, self.log_line.emit)
+            self.log_line.emit('\nSelecting energies (equidistant Δf′ for elem 1) …')
+            energies, elem_results = _select_energies_multi(cfg, self.log_line.emit)
+            n_elem = len(elem_results)
+
+            # Build per-element scaled partials
+            # I_RiM  = scale_i × I_RM_base
+            # I_RiRi = scale_i² × I_RR_base
+            # I_RiRj = scale_i × scale_j × I_RR_base  (cross-terms, co-location assumed)
+            scales = [e['scale'] for e in elem_results]
+            I_RiM  = [scales[i] * I_RM_base  for i in range(n_elem)]
+            I_RiRi = [scales[i]**2 * I_RR_base for i in range(n_elem)]
+            I_RiRj = {}
+            for i in range(n_elem):
+                for j in range(i+1, n_elem):
+                    I_RiRj[(i,j)] = scales[i] * scales[j] * I_RR_base
 
             nc = cfg['noise']
             if nc['model'] == 'poisson':
-                self.log_line.emit(f'\nNoise: Poisson, N_peak={nc["N_peak"]:.0f}  → σ/I(q_min) = {1/np.sqrt(nc["N_peak"])*100:.2f}%')
+                self.log_line.emit(
+                    f'\nNoise: Poisson, N_peak={nc["N_peak"]:.0f}  '
+                    f'→ σ/I(q_min) = {1/np.sqrt(nc["N_peak"])*100:.2f}%')
             else:
                 self.log_line.emit(f'\nNoise: relative {nc.get("relative",0.005)*100:.2f}%')
 
@@ -190,29 +376,60 @@ class _GeneratorThread(QThread):
             self.log_line.emit(f'\nWriting {len(energies)} files to {out_dir}/ …')
 
             I_obs_list = []
-            for i, (E, fp, fpp) in enumerate(zip(energies, fp_vals, fpp_vals)):
-                I_tot        = I_MM + 2*fp*I_RM + (fp**2 + fpp**2)*I_RR
+            for k, E in enumerate(energies):
+                I_tot = I_MM_base.copy()
+                # Self terms
+                for i, er in enumerate(elem_results):
+                    fp_i  = er['fp'][k]
+                    fpp_i = er['fpp'][k]
+                    I_tot += 2*fp_i * I_RiM[i] + (fp_i**2 + fpp_i**2) * I_RiRi[i]
+                # Cross terms
+                for i in range(n_elem):
+                    for j in range(i+1, n_elem):
+                        fp_i, fpp_i = elem_results[i]['fp'][k], elem_results[i]['fpp'][k]
+                        fp_j, fpp_j = elem_results[j]['fp'][k], elem_results[j]['fpp'][k]
+                        I_tot += 2*(fp_i*fp_j + fpp_i*fpp_j) * I_RiRj[(i,j)]
+
                 I_obs, sigma = _make_noise(I_tot, cfg, rng)
                 I_obs_list.append(I_obs)
+
                 core = cfg['core']
+                fp_strs = '  '.join(f"f'{i+1}={elem_results[i]['fp'][k]:.3f}" for i in range(n_elem))
                 hdr = (
-                    f"Synthetic ASAXS — Z={core['Z']} core, R_mean={core['radius_mean']:.1f} A"
+                    f"Synthetic ASAXS — {n_elem} resonant element(s)\n"
+                    f"  Core Z={core['Z']}, R_mean={core['radius_mean']:.1f} A"
                     f", sig_rel={core.get('sigma_rel',0)*100:.0f}%\n"
                     f"  Shell R_outer={cfg['shell']['radius_outer']:.1f} A"
                     f",  phi={cfg['experiment']['volume_fraction']:.2e}"
-                    f",  noise={nc['model']}"
-                    + (f",  N_peak={nc['N_peak']}" if nc['model']=='poisson'
-                       else f",  rel={nc.get('relative',0):.3f}") + "\n"
-                    f"  Energy={E:.4f} keV,  f'={fp:.4f} e,  f''={fpp:.4f} e\n"
+                    f",  noise={nc['model']}\n"
+                    f"  Energy={E:.4f} keV  {fp_strs}\n"
                     f"  Columns: q(1/A)  I(cm-1)  sigma(cm-1)"
                 )
                 np.savetxt(out_dir / f"{name}_{E:.4f}keV.dat",
                            np.column_stack([q, I_obs, sigma]), header=hdr, fmt="%.6e")
-                self.log_line.emit(f'  [{i+1:2d}/{len(energies)}]  {E:.4f} keV  f′={fp:.3f} e  f″={fpp:.3f} e')
+                fp1 = elem_results[0]['fp'][k]; fpp1 = elem_results[0]['fpp'][k]
+                self.log_line.emit(
+                    f'  [{k+1:2d}/{len(energies)}]  {E:.4f} keV  '
+                    + '  '.join(f"f'_{i+1}={elem_results[i]['fp'][k]:.3f}"
+                                f" f\"_{i+1}={elem_results[i]['fpp'][k]:.3f}"
+                                for i in range(n_elem)))
 
-            np.savetxt(out_dir / "ground_truth_partials.dat",
-                       np.column_stack([q, I_MM, I_RM, I_RR]),
-                       header="q(1/A)  I_MM(cm-1)  I_RM(cm-1)  I_RR(cm-1)", fmt="%.6e")
+            # Ground-truth file — all partials
+            from .core.decompose import partial_names_multi
+            names_gt = partial_names_multi(n_elem)
+            cols_gt  = [q, I_MM_base]
+            for i in range(n_elem):
+                cols_gt.append(I_RiM[i])
+            for i in range(n_elem):
+                cols_gt.append(I_RiRi[i])
+            for i in range(n_elem):
+                for j in range(i+1, n_elem):
+                    cols_gt.append(I_RiRj[(i,j)])
+            hdr_gt = 'q(1/A)  ' + '  '.join(f'{nm}(cm-1)' for nm in names_gt)
+            scales_str = '  '.join(f'scale_{i+1}={scales[i]:.3f}' for i in range(n_elem))
+            hdr_gt = f'Resonant elements: {[e["Z"] for e in elem_results]}  {scales_str}\n' + hdr_gt
+            np.savetxt(out_dir / 'ground_truth_partials.dat',
+                       np.column_stack(cols_gt), header=hdr_gt, fmt='%.6e')
             self.log_line.emit('\nground_truth_partials.dat saved.')
             self.log_line.emit(f'\nDone — {len(energies)} datasets in {out_dir}/')
 
@@ -264,6 +481,19 @@ class SimDataTab(QWidget):
         btn_core = QPushButton('Apply'); btn_core.setFixedWidth(60)
         r = QHBoxLayout(); r.addWidget(self._core_preset); r.addWidget(btn_core)
         core_form.addRow('Element preset:', r)
+
+        self._core_formula = QLineEdit()
+        self._core_formula.setPlaceholderText('e.g.  Au')
+        btn_core_fml = QPushButton('← fill M, ne')
+        btn_core_fml.setFixedWidth(90)
+        self._lbl_core_sld = QLabel()
+        self._lbl_core_sld.setStyleSheet('color: #555;')
+        fml_row_c = QHBoxLayout()
+        fml_row_c.addWidget(self._core_formula); fml_row_c.addWidget(btn_core_fml)
+        core_form.addRow('Formula:', fml_row_c)
+        core_form.addRow('', self._lbl_core_sld)
+        btn_core_fml.clicked.connect(self._fill_core_from_formula)
+
         self._core_Z   = _int(79, lo=1, hi=118)
         self._core_rho = _dbl(19.32, decimals=4)
         self._core_M   = _dbl(196.97, decimals=4)
@@ -294,20 +524,41 @@ class SimDataTab(QWidget):
         btn_shell = QPushButton('Apply'); btn_shell.setFixedWidth(60)
         r2 = QHBoxLayout(); r2.addWidget(self._shell_preset); r2.addWidget(btn_shell)
         shell_form.addRow('Material preset:', r2)
+
+        self._shell_formula = QLineEdit()
+        self._shell_formula.setPlaceholderText('e.g.  SiO2')
+        btn_shell_fml = QPushButton('← fill M, ne')
+        btn_shell_fml.setFixedWidth(90)
+        self._lbl_shell_sld = QLabel()
+        self._lbl_shell_sld.setStyleSheet('color: #555;')
+        fml_row_s = QHBoxLayout()
+        fml_row_s.addWidget(self._shell_formula); fml_row_s.addWidget(btn_shell_fml)
+        shell_form.addRow('Formula:', fml_row_s)
+        shell_form.addRow('', self._lbl_shell_sld)
+        btn_shell_fml.clicked.connect(self._fill_shell_from_formula)
+
         self._shell_rho = _dbl(2.196, decimals=4)
         self._shell_M   = _dbl(60.08, decimals=4)
         self._shell_ne  = _int(30)
         self._shell_Rt  = _dbl(220.0, lo=0.1, hi=1e5, decimals=2, step=1.0)
+        self._shell_sig = _dbl(0.0, lo=0.0, hi=2.0, decimals=3, step=0.01)
+        self._lbl_shell_sig = QLabel('(monodisperse)')
         self._lbl_thick = QLabel()
         shell_form.addRow('ρ (g/cm³):',    self._shell_rho)
         shell_form.addRow('M (g/mol):',     self._shell_M)
         shell_form.addRow('e⁻/formula:',    self._shell_ne)
         shell_form.addRow('R_outer (Å):',   self._shell_Rt)
+        shell_sig_row = QHBoxLayout()
+        shell_sig_row.addWidget(self._shell_sig); shell_sig_row.addWidget(self._lbl_shell_sig)
+        shell_form.addRow('σ_rel (R_outer):', shell_sig_row)
         shell_form.addRow('Shell thickness:', self._lbl_thick)
         form_lay.addWidget(shell_grp)
         btn_shell.clicked.connect(self._apply_shell_preset)
         self._core_R.valueChanged.connect(self._update_thickness)
         self._shell_Rt.valueChanged.connect(self._update_thickness)
+        self._shell_sig.valueChanged.connect(self._update_thickness)
+        self._shell_sig.valueChanged.connect(
+            lambda v: self._lbl_shell_sig.setText('(monodisperse)' if v == 0 else f'= {v*100:.0f}%'))
         self._update_thickness()
 
         # ── Solvent ───────────────────────────────────────────────────────────
@@ -319,6 +570,19 @@ class SimDataTab(QWidget):
         btn_solv = QPushButton('Apply'); btn_solv.setFixedWidth(60)
         r3 = QHBoxLayout(); r3.addWidget(self._solv_preset); r3.addWidget(btn_solv)
         solv_form.addRow('Material preset:', r3)
+
+        self._solv_formula = QLineEdit()
+        self._solv_formula.setPlaceholderText('e.g.  H2O')
+        btn_solv_fml = QPushButton('← fill M, ne')
+        btn_solv_fml.setFixedWidth(90)
+        self._lbl_solv_sld = QLabel()
+        self._lbl_solv_sld.setStyleSheet('color: #555;')
+        fml_row_v = QHBoxLayout()
+        fml_row_v.addWidget(self._solv_formula); fml_row_v.addWidget(btn_solv_fml)
+        solv_form.addRow('Formula:', fml_row_v)
+        solv_form.addRow('', self._lbl_solv_sld)
+        btn_solv_fml.clicked.connect(self._fill_solv_from_formula)
+
         self._solv_rho = _dbl(1.000, decimals=4)
         self._solv_M   = _dbl(18.015, decimals=4)
         self._solv_ne  = _int(10)
@@ -332,22 +596,76 @@ class SimDataTab(QWidget):
         en_grp  = QGroupBox('Energies')
         en_form = QFormLayout(en_grp)
 
-        self._exp_Z    = _int(79, lo=1, hi=118)
-        self._lbl_edge = QLabel()
+        # Three resonant-element rows
+        self._sim_elem_Z:     list = []
+        self._sim_elem_amp:   list = []
+        self._sim_elem_chk:   list = []
+        self._sim_elem_lbl:   list = []
+
+        elem_widget = QWidget()
+        elem_vlay   = QVBoxLayout(elem_widget)
+        elem_vlay.setContentsMargins(0, 0, 0, 0)
+        elem_vlay.setSpacing(3)
+        for i in range(3):
+            row = QHBoxLayout()
+            if i == 0:
+                row.addWidget(QLabel('Elem 1 (primary):'))
+                chk = None
+            else:
+                chk = QCheckBox(f'Elem {i+1}:')
+                chk.setChecked(False)
+                row.addWidget(chk)
+            self._sim_elem_chk.append(chk)
+
+            row.addWidget(QLabel('Z:'))
+            z_sb = _int(79 - i*5, lo=1, hi=118)
+            z_sb.setFixedWidth(55)
+            self._sim_elem_Z.append(z_sb)
+            row.addWidget(z_sb)
+
+            row.addWidget(QLabel('Amp:'))
+            amp_sb = _dbl(1.0 if i == 0 else 0.5, lo=0.0, hi=100.0, decimals=3, step=0.05)
+            amp_sb.setFixedWidth(70)
+            self._sim_elem_amp.append(amp_sb)
+            row.addWidget(amp_sb)
+
+            lbl = QLabel()
+            lbl.setStyleSheet('color: #666; font-size: 11px;')
+            lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            self._sim_elem_lbl.append(lbl)
+            row.addWidget(lbl, 1)
+            elem_vlay.addLayout(row)
+
+            # Wire signals
+            z_sb.valueChanged.connect(lambda v, ei=i: self._update_sim_edge_info(ei))
+            if chk is not None:
+                chk.toggled.connect(lambda checked, ei=i: self._sim_elem_Z[ei].setEnabled(checked)
+                                    or self._sim_elem_amp[ei].setEnabled(checked))
+                z_sb.setEnabled(False)
+                amp_sb.setEnabled(False)
+                chk.toggled.connect(lambda checked, ei=i: (
+                    self._sim_elem_Z[ei].setEnabled(checked),
+                    self._sim_elem_amp[ei].setEnabled(checked),
+                ))
+
+        en_form.addRow('Resonant elements:', elem_widget)
+
+        # Backward-compat alias — _exp_Z points to elem-1 spinbox
+        self._exp_Z    = self._sim_elem_Z[0]
+        self._lbl_edge = self._sim_elem_lbl[0]
+
         self._exp_Emin = _dbl(10.919, lo=0.1, hi=1000.0, decimals=4, step=0.01)
         self._exp_Emax = _dbl(11.919, lo=0.1, hi=1000.0, decimals=4, step=0.01)
         self._exp_N    = _int(20, lo=2, hi=200)
 
-        en_form.addRow('Resonant element Z:', self._exp_Z)
-        en_form.addRow('Edge energies:',       self._lbl_edge)
-        en_form.addRow('E_min (keV):',         self._exp_Emin)
-        en_form.addRow('E_max (keV):',         self._exp_Emax)
-        en_form.addRow('N energies:',          self._exp_N)
+        en_form.addRow('E_min (keV):',  self._exp_Emin)
+        en_form.addRow('E_max (keV):',  self._exp_Emax)
+        en_form.addRow('N energies:',   self._exp_N)
 
         note = QLabel(
             '<i>Energies are spaced for equal Δf′ steps across [E_min, E_max].<br>'
-            'This maximises the variation in f′ between measurements,<br>'
-            'which is required for accurate ASAXS decomposition.</i>')
+            'Amp = relative resonant amplitude (1.0 = same as primary element).<br>'
+            'Cross-terms I_RiRj assume co-located resonant atoms.</i>')
         note.setWordWrap(True)
         en_form.addRow(note)
 
@@ -355,10 +673,11 @@ class SimDataTab(QWidget):
         en_form.addRow(self._btn_preview_E)
         form_lay.addWidget(en_grp)
 
-        self._exp_Z.valueChanged.connect(self._update_edge_info)
+        self._exp_Z.valueChanged.connect(lambda v: self._update_sim_edge_info(0))
         self._core_Z.valueChanged.connect(lambda v: self._exp_Z.setValue(v))
         self._btn_preview_E.clicked.connect(self._preview_energies)
-        self._update_edge_info()
+        for i in range(3):
+            self._update_sim_edge_info(i)
 
         # ── Sample ────────────────────────────────────────────────────────────
         samp_grp  = QGroupBox('Sample')
@@ -407,6 +726,16 @@ class SimDataTab(QWidget):
         out_form.addRow('File prefix:', self._out_name)
         form_lay.addWidget(out_grp)
         btn_browse.clicked.connect(self._browse_dir)
+
+        # ── Settings save/load ────────────────────────────────────────────────
+        settings_row = QHBoxLayout()
+        self._btn_save_cfg = QPushButton('Save settings…')
+        self._btn_load_cfg = QPushButton('Load settings…')
+        settings_row.addWidget(self._btn_save_cfg)
+        settings_row.addWidget(self._btn_load_cfg)
+        form_lay.addLayout(settings_row)
+        self._btn_save_cfg.clicked.connect(self._save_settings)
+        self._btn_load_cfg.clicked.connect(self._load_settings)
 
         # ── Generate ──────────────────────────────────────────────────────────
         self._btn_gen = QPushButton('Generate data')
@@ -460,6 +789,57 @@ class SimDataTab(QWidget):
         right_split.setSizes([500, 260])
         main_split.setSizes([400, 800])
 
+    # ─── Formula fill handlers ────────────────────────────────────────────────
+
+    def _fill_core_from_formula(self):
+        formula = self._core_formula.text().strip()
+        if not formula:
+            return
+        try:
+            M, ne = _formula_to_Mne(formula)
+            self._core_M.setValue(M)
+            self._core_ne.setValue(ne)
+            counts = _parse_formula(formula)
+            if len(counts) == 1:
+                sym = next(iter(counts))
+                Z = _element_Z(sym)
+                if Z:
+                    self._core_Z.setValue(Z)
+                    self._exp_Z.setValue(Z)
+            rho = self._core_rho.value()
+            sld = _elec_density(rho, M, ne)
+            self._lbl_core_sld.setText(f'M = {M:.3f} g/mol,  ne = {ne},  ρ_e = {sld:.3f} e/Å³')
+        except Exception as e:
+            self._lbl_core_sld.setText(f'Error: {e}')
+
+    def _fill_shell_from_formula(self):
+        formula = self._shell_formula.text().strip()
+        if not formula:
+            return
+        try:
+            M, ne = _formula_to_Mne(formula)
+            self._shell_M.setValue(M)
+            self._shell_ne.setValue(ne)
+            rho = self._shell_rho.value()
+            sld = _elec_density(rho, M, ne)
+            self._lbl_shell_sld.setText(f'M = {M:.3f} g/mol,  ne = {ne},  ρ_e = {sld:.3f} e/Å³')
+        except Exception as e:
+            self._lbl_shell_sld.setText(f'Error: {e}')
+
+    def _fill_solv_from_formula(self):
+        formula = self._solv_formula.text().strip()
+        if not formula:
+            return
+        try:
+            M, ne = _formula_to_Mne(formula)
+            self._solv_M.setValue(M)
+            self._solv_ne.setValue(ne)
+            rho = self._solv_rho.value()
+            sld = _elec_density(rho, M, ne)
+            self._lbl_solv_sld.setText(f'M = {M:.3f} g/mol,  ne = {ne},  ρ_e = {sld:.3f} e/Å³')
+        except Exception as e:
+            self._lbl_solv_sld.setText(f'Error: {e}')
+
     # ─── Preset appliers ──────────────────────────────────────────────────────
 
     def _apply_core_preset(self):
@@ -487,12 +867,18 @@ class SimDataTab(QWidget):
             self._solv_ne.setValue(p['n_electrons'])
 
     def _update_thickness(self):
-        self._lbl_thick.setText(f'{self._shell_Rt.value() - self._core_R.value():.1f} Å')
+        delta = self._shell_Rt.value() - self._core_R.value()
+        sig   = self._shell_sig.value()
+        if sig > 0:
+            self._lbl_thick.setText(f'{delta:.1f} Å  (R_outer σ={sig*100:.0f}%)')
+        else:
+            self._lbl_thick.setText(f'{delta:.1f} Å')
 
-    def _update_edge_info(self):
+    def _update_sim_edge_info(self, elem_idx: int = 0):
+        lbl = self._sim_elem_lbl[elem_idx]
         if not _HAS_XRAYDB:
-            self._lbl_edge.setText('xraydb not installed'); return
-        Z = self._exp_Z.value()
+            lbl.setText('xraydb not installed'); return
+        Z = self._sim_elem_Z[elem_idx].value()
         try:
             edges = xraydb.xray_edges(Z)
             parts = []
@@ -500,9 +886,12 @@ class SimDataTab(QWidget):
                 if sh in edges:
                     parts.append(f'{sh}: {edges[sh].energy/1000:.3f} keV')
                     if len(parts) == 3: break
-            self._lbl_edge.setText('  '.join(parts))
+            lbl.setText('  '.join(parts))
         except Exception:
-            self._lbl_edge.setText('')
+            lbl.setText('')
+
+    def _update_edge_info(self):
+        self._update_sim_edge_info(0)
 
     def _browse_dir(self):
         d = QFileDialog.getExistingDirectory(self, 'Output directory', self._out_dir.text())
@@ -512,19 +901,30 @@ class SimDataTab(QWidget):
         if not _HAS_XRAYDB:
             self._log.append('xraydb not installed'); return
         cfg = self._build_config()
+        elems = cfg['resonant_elements']
         self._log.append('<b>Energy preview:</b>')
-        self._log.append(f'  Z={cfg["experiment"]["resonant_Z"]},  '
-                         f'E: {cfg["experiment"]["E_min_keV"]:.4f}–{cfg["experiment"]["E_max_keV"]:.4f} keV,  '
-                         f'N={cfg["experiment"]["n_energies"]}')
-        self._log.append('  Energies are chosen to be equidistant in f′(E) — this maximises')
-        self._log.append('  the matrix condition number for the linear decomposition.')
-        self._log.append(f'  {"E (keV)":>10}  {"f′ (e)":>8}  {"f″ (e)":>8}')
-        self._log.append(f'  {"-"*34}')
+        self._log.append(
+            f'  {len(elems)} element(s): Z={[e["Z"] for e in elems]}  '
+            f'E: {cfg["experiment"]["E_min_keV"]:.4f}–{cfg["experiment"]["E_max_keV"]:.4f} keV  '
+            f'N={cfg["experiment"]["n_energies"]}')
         try:
-            Es, fp, fpp = _select_energies(cfg)
-            for e, f, ff in zip(Es, fp, fpp):
-                self._log.append(f'  {e:10.4f}  {f:8.3f}  {ff:8.3f}')
-            self._log.append(f'  f′ range: {fp.min():.3f} → {fp.max():.3f} e  (Δf′={fp.max()-fp.min():.3f} e)')
+            Es, elem_results = _select_energies_multi(cfg)
+            n = len(elem_results)
+            fp_hdrs  = ''.join(f"  {('fp_'+str(i+1)):>9}"  for i in range(n))
+            fpp_hdrs = ''.join(f"  {('fpp_'+str(i+1)):>9}" for i in range(n))
+            hdr = f'  {"E (keV)":>10}' + fp_hdrs + fpp_hdrs
+            self._log.append(hdr)
+            self._log.append('  ' + '-' * len(hdr))
+            for k, e in enumerate(Es):
+                row = f'  {e:10.4f}'
+                for er in elem_results: row += f'  {er["fp"][k]:9.3f}'
+                for er in elem_results: row += f'  {er["fpp"][k]:9.3f}'
+                self._log.append(row)
+            for i, er in enumerate(elem_results):
+                fp = er['fp']
+                self._log.append(
+                    f"  Elem {i+1} (Z={er['Z']}): "
+                    f"f' range {fp.min():.3f}→{fp.max():.3f} e  Δf'={fp.max()-fp.min():.3f} e")
         except Exception as ex:
             self._log.append(f'  Error: {ex}')
 
@@ -532,19 +932,28 @@ class SimDataTab(QWidget):
 
     def _build_config(self) -> dict:
         out_path = Path(self._out_dir.text()) / self._out_name.text()
+        # Collect active resonant elements
+        res_elems = [{'Z': self._sim_elem_Z[0].value(),
+                      'scale': self._sim_elem_amp[0].value()}]
+        for i in range(1, 3):
+            if self._sim_elem_chk[i] is not None and self._sim_elem_chk[i].isChecked():
+                res_elems.append({'Z':    self._sim_elem_Z[i].value(),
+                                  'scale': self._sim_elem_amp[i].value()})
         return {
             'system': {'description': f'Z={self._core_Z.value()} core R_mean={self._core_R.value():.1f}A'},
             'core':   {'Z': self._core_Z.value(), 'mass_density': self._core_rho.value(),
                        'molar_mass': self._core_M.value(), 'n_electrons': self._core_ne.value(),
                        'radius_mean': self._core_R.value(), 'sigma_rel': self._core_sig.value()},
             'shell':  {'mass_density': self._shell_rho.value(), 'molar_mass': self._shell_M.value(),
-                       'n_electrons': self._shell_ne.value(), 'radius_outer': self._shell_Rt.value()},
+                       'n_electrons': self._shell_ne.value(), 'radius_outer': self._shell_Rt.value(),
+                       'sigma_rel': self._shell_sig.value()},
             'solvent':{'mass_density': self._solv_rho.value(), 'molar_mass': self._solv_M.value(),
                        'n_electrons': self._solv_ne.value()},
             'experiment': {'volume_fraction': self._exp_phi.value(),
-                           'resonant_Z': self._exp_Z.value(),
+                           'resonant_Z': self._sim_elem_Z[0].value(),
                            'E_min_keV': self._exp_Emin.value(), 'E_max_keV': self._exp_Emax.value(),
                            'n_energies': self._exp_N.value()},
+            'resonant_elements': res_elems,
             'q_grid': {'q_min': self._q_min.value(), 'q_max': self._q_max.value(),
                        'n_points': self._q_n.value(),
                        'spacing': 'log' if self._q_log.currentIndex() == 0 else 'linear'},
@@ -553,6 +962,105 @@ class SimDataTab(QWidget):
             'output': {'directory': str(out_path), 'name': self._out_name.text()},
         }
 
+    # ─── Settings save / load ────────────────────────────────────────────────
+
+    def _save_settings(self):
+        import json
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Save simulation settings', '',
+            'ASAXS sim settings (*.asaxs_sim);;JSON files (*.json);;All files (*)')
+        if not path:
+            return
+        cfg = self._build_config()
+        cfg['_out_dir_raw'] = self._out_dir.text()   # preserve raw dir separately
+        try:
+            with open(path, 'w') as f:
+                json.dump(cfg, f, indent=2)
+            self._log.append(f'<b>Settings saved:</b> {path}')
+        except Exception as e:
+            self._log.append(f'<b>Save error:</b> {e}')
+
+    def _load_settings(self):
+        import json
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Load simulation settings', '',
+            'ASAXS sim settings (*.asaxs_sim);;JSON files (*.json);;All files (*)')
+        if not path:
+            return
+        try:
+            with open(path, 'r') as f:
+                cfg = json.load(f)
+            self._apply_config(cfg)
+            self._log.append(f'<b>Settings loaded:</b> {path}')
+        except Exception as e:
+            self._log.append(f'<b>Load error:</b> {e}')
+
+    def _apply_config(self, cfg: dict):
+        """Populate all UI widgets from a saved config dict."""
+        c = cfg.get('core', {})
+        if 'Z'            in c: self._core_Z.setValue(c['Z'])
+        if 'mass_density' in c: self._core_rho.setValue(c['mass_density'])
+        if 'molar_mass'   in c: self._core_M.setValue(c['molar_mass'])
+        if 'n_electrons'  in c: self._core_ne.setValue(c['n_electrons'])
+        if 'radius_mean'  in c: self._core_R.setValue(c['radius_mean'])
+        if 'sigma_rel'    in c: self._core_sig.setValue(c['sigma_rel'])
+
+        s = cfg.get('shell', {})
+        if 'mass_density' in s: self._shell_rho.setValue(s['mass_density'])
+        if 'molar_mass'   in s: self._shell_M.setValue(s['molar_mass'])
+        if 'n_electrons'  in s: self._shell_ne.setValue(s['n_electrons'])
+        if 'radius_outer' in s: self._shell_Rt.setValue(s['radius_outer'])
+        if 'sigma_rel'    in s: self._shell_sig.setValue(s['sigma_rel'])
+
+        v = cfg.get('solvent', {})
+        if 'mass_density' in v: self._solv_rho.setValue(v['mass_density'])
+        if 'molar_mass'   in v: self._solv_M.setValue(v['molar_mass'])
+        if 'n_electrons'  in v: self._solv_ne.setValue(v['n_electrons'])
+
+        e = cfg.get('experiment', {})
+        if 'volume_fraction' in e: self._exp_phi.setValue(e['volume_fraction'])
+        if 'E_min_keV'       in e: self._exp_Emin.setValue(e['E_min_keV'])
+        if 'E_max_keV'       in e: self._exp_Emax.setValue(e['E_max_keV'])
+        if 'n_energies'      in e: self._exp_N.setValue(e['n_energies'])
+
+        elems = cfg.get('resonant_elements', [])
+        if elems:
+            self._sim_elem_Z[0].setValue(elems[0].get('Z', 79))
+            self._sim_elem_amp[0].setValue(elems[0].get('scale', 1.0))
+        for i in range(1, 3):
+            chk = self._sim_elem_chk[i]
+            if chk is None:
+                continue
+            if i < len(elems):
+                chk.setChecked(True)
+                self._sim_elem_Z[i].setValue(elems[i].get('Z', 79))
+                self._sim_elem_amp[i].setValue(elems[i].get('scale', 0.5))
+            else:
+                chk.setChecked(False)
+
+        qg = cfg.get('q_grid', {})
+        if 'q_min'    in qg: self._q_min.setValue(qg['q_min'])
+        if 'q_max'    in qg: self._q_max.setValue(qg['q_max'])
+        if 'n_points' in qg: self._q_n.setValue(qg['n_points'])
+        if 'spacing'  in qg:
+            self._q_log.setCurrentIndex(0 if qg['spacing'] == 'log' else 1)
+
+        n = cfg.get('noise', {})
+        if n.get('model') == 'poisson':
+            self._rb_poisson.setChecked(True)
+        elif n.get('model') == 'relative':
+            self._rb_relative.setChecked(True)
+        if 'N_peak'   in n: self._n_peak.setValue(int(n['N_peak']))
+        if 'relative' in n: self._n_rel.setValue(n['relative'])
+
+        out = cfg.get('output', {})
+        if '_out_dir_raw' in cfg:
+            self._out_dir.setText(cfg['_out_dir_raw'])
+        elif 'directory' in out:
+            self._out_dir.setText(str(Path(out['directory']).parent))
+        if 'name' in out:
+            self._out_name.setText(out['name'])
+
     # ─── Generation ──────────────────────────────────────────────────────────
 
     def _generate(self):
@@ -560,15 +1068,33 @@ class SimDataTab(QWidget):
             self._log.append('<b>Error:</b> xraydb not installed — run: pip install xraydb'); return
         if self._thread and self._thread.isRunning():
             return
+        import json
         cfg = self._build_config()
+        cfg['_out_dir_raw'] = self._out_dir.text()
+
+        # Auto-save settings alongside the data files
+        try:
+            out_dir = Path(cfg['output']['directory'])
+            out_dir.mkdir(parents=True, exist_ok=True)
+            settings_path = out_dir / f"{cfg['output']['name']}_settings.asaxs_sim"
+            with open(settings_path, 'w') as _f:
+                json.dump(cfg, _f, indent=2)
+        except Exception as _e:
+            settings_path = None
+
         self._log.clear()
+        elems = cfg['resonant_elements']
         self._log.append('<b>Generating ASAXS data …</b>')
         self._log.append(f'Core:    Z={cfg["core"]["Z"]}, R_mean={cfg["core"]["radius_mean"]:.1f} Å'
                          f', σ_rel={cfg["core"]["sigma_rel"]*100:.0f}%')
         self._log.append(f'Shell:   R_outer={cfg["shell"]["radius_outer"]:.1f} Å')
+        elem_str = '  '.join(f'Z={e["Z"]} amp={e["scale"]:.2f}' for e in elems)
+        self._log.append(f'Elements ({len(elems)}): {elem_str}')
         self._log.append(f'Energies:{cfg["experiment"]["E_min_keV"]:.4f}–{cfg["experiment"]["E_max_keV"]:.4f} keV'
-                         f'  ({cfg["experiment"]["n_energies"]} points, equidistant Δf′)')
+                         f'  ({cfg["experiment"]["n_energies"]} points, equidistant Δf′ for elem 1)')
         self._log.append(f'Output:  {cfg["output"]["directory"]}/')
+        if settings_path:
+            self._log.append(f'Settings: {settings_path.name}  (auto-saved)')
         self._log.append('')
         self._btn_gen.setEnabled(False)
         self._btn_gen.setText('Generating …')

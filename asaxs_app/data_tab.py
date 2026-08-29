@@ -5,7 +5,8 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QFileDialog, QAbstractItemView,
-    QLabel, QDoubleSpinBox, QMessageBox, QSplitter, QCheckBox,
+    QLabel, QDoubleSpinBox, QMessageBox, QSplitter, QCheckBox, QSlider,
+    QComboBox, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
@@ -13,6 +14,7 @@ import pyqtgraph as pg
 
 from .core.io import load_file, interpolate_to_common_q
 from .core.crosshair import add_crosshair
+
 
 
 def _energy_color(t: float) -> tuple[int, int, int]:
@@ -28,7 +30,8 @@ def _energy_color(t: float) -> tuple[int, int, int]:
 
 
 class DataTab(QWidget):
-    datasets_changed = pyqtSignal(list)  # emits active (checked) datasets sorted by E
+    datasets_changed = pyqtSignal(list)   # active datasets sorted by E
+    fp_fpp_ready     = pyqtSignal(list)   # list of {'Z','label','fp','fpp'} dicts
 
     # Column indices — col 0 is the ✓ checkbox (Use), rest are info
     _COL_USE    = 0
@@ -41,8 +44,22 @@ class DataTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._datasets: list[dict] = []   # all loaded datasets
-        self._curves:   list       = []   # pg.PlotDataItem per dataset (same order)
+        self._datasets: list[dict]  = []
+        self._curves:   list        = []
+        # Per-element state (3 slots)
+        self._elem_Z:     list[int]        = [0, 0, 0]
+        self._elem_shell: list[str]        = ['', '', '']
+        self._elem_fp:    list             = [np.array([]), np.array([]), np.array([])]
+        self._elem_fpp:   list             = [np.array([]), np.array([]), np.array([])]
+        self._elem_chk:   list             = []   # filled in _build_ui
+        self._elem_combo: list             = []
+        self._elem_lbl_edge:   list        = []
+        self._elem_lbl_status: list        = []
+        self._preset_maps: list[dict]      = [{}, {}, {}]
+        # Stuhrmann slice panels
+        self._slice_panels: list           = []   # pg.PlotWidget per active elem
+        self._slice_items:  list           = []   # list of lists of items
+        self._stuhr_right_split            = None
         self._build_ui()
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -60,11 +77,61 @@ class DataTab(QWidget):
         btn_row.addStretch()
         lay.addLayout(btn_row)
 
+        # ── Resonant element rows (up to 3 elements) ─────────────────────────
+        elem_grid = QHBoxLayout()
+        for i in range(3):
+            grp = QHBoxLayout()
+            grp.addWidget(QLabel(f'Element {i+1}:'))
+            chk = QCheckBox()
+            if i == 0:
+                chk.setChecked(True)
+                chk.setEnabled(False)
+            else:
+                chk.setChecked(False)
+            self._elem_chk.append(chk)
+            grp.addWidget(chk)
+
+            combo = QComboBox()
+            combo.addItem('(select element)')
+            combo.setMinimumWidth(220)
+            if i != 0:
+                combo.setEnabled(False)
+            self._elem_combo.append(combo)
+            grp.addWidget(combo)
+
+            lbl_edge = QLabel('—')
+            self._elem_lbl_edge.append(lbl_edge)
+            grp.addWidget(QLabel('Edge:'))
+            grp.addWidget(lbl_edge)
+
+            lbl_st = QLabel()
+            lbl_st.setStyleSheet('font-size: 11px;')
+            lbl_st.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                  QSizePolicy.Policy.Preferred)
+            self._elem_lbl_status.append(lbl_st)
+            grp.addWidget(lbl_st)
+
+            if i < 2:
+                sep = QLabel(' | ')
+                grp.addWidget(sep)
+
+            elem_grid.addLayout(grp)
+
+            # Wire signals — capture i in default arg
+            combo.currentIndexChanged.connect(
+                lambda idx, ei=i: self._on_element_preset(idx, ei))
+            chk.toggled.connect(
+                lambda checked, ei=i: self._on_elem_chk_toggled(checked, ei))
+
+        elem_grid.addStretch()
+        lay.addLayout(elem_grid)
+
         # Splitter: table on left, plot on right
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # ── Left panel: table + q-range controls ──────────────────────────────
         left = QWidget()
+        left.setMaximumWidth(520)
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
 
@@ -76,7 +143,10 @@ class DataTab(QWidget):
         hdr.setSectionResizeMode(self._COL_QRANGE, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(self._COL_NPTS,   QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(self._COL_SNR,    QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(self._COL_FILE,   QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(self._COL_FILE,   QHeaderView.ResizeMode.Interactive)
+        hdr.setDefaultSectionSize(160)   # initial File column width
+        self._table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
         left_lay.addWidget(self._table)
@@ -96,39 +166,80 @@ class DataTab(QWidget):
         left_lay.addLayout(qrow)
 
         splitter.addWidget(left)
+        splitter.setStretchFactor(0, 0)   # left panel: don't stretch
 
-        # ── Right panel: plot ─────────────────────────────────────────────────
+        # ── Right panel: waterfall (left) + Stuhrmann slice (right) ──────────
         right = QWidget()
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(0, 0, 0, 0)
 
         plot_ctrl = QHBoxLayout()
         self._chk_logx = QCheckBox('Log q')
+        self._chk_logx.setChecked(True)
         self._chk_logy = QCheckBox('Log I')
         self._chk_logy.setChecked(True)
         self._chk_logx.toggled.connect(self._update_log)
         self._chk_logy.toggled.connect(self._update_log)
+        self._chk_slice_logy = QCheckBox('Log I (slice)')
+        self._chk_slice_logy.setChecked(True)
+        self._chk_slice_logy.toggled.connect(self._on_slice_logy_toggled)
         plot_ctrl.addWidget(self._chk_logx)
         plot_ctrl.addWidget(self._chk_logy)
+        plot_ctrl.addWidget(QLabel('   '))
+        plot_ctrl.addWidget(self._chk_slice_logy)
         plot_ctrl.addStretch()
         right_lay.addLayout(plot_ctrl)
 
+        inner_split = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left: I(q,E) waterfall with vertical q-selection line
         self._pw = pg.PlotWidget(title='I(q, E) — all loaded datasets')
         self._pw.setLabel('bottom', 'q (Å⁻¹)')
         self._pw.setLabel('left', 'I(q) (cm⁻¹)')
-        self._pw.setLogMode(x=False, y=True)
-        right_lay.addWidget(self._pw)
+        self._pw.setLogMode(x=True, y=True)
+        self._st_vline = pg.InfiniteLine(
+            angle=90, movable=False,
+            pen=pg.mkPen('#ffffff', width=1.5,
+                         style=Qt.PenStyle.DashLine))
+        self._pw.addItem(self._st_vline)
+        inner_split.addWidget(self._pw)
+
+        # Right: vertical splitter containing N element slice panels
+        self._stuhr_right_split = QSplitter(Qt.Orientation.Vertical)
+        inner_split.addWidget(self._stuhr_right_split)
+        inner_split.setSizes([580, 420])
+
+        right_lay.addWidget(inner_split, 1)
+
+        # Q slider
+        sl_row = QHBoxLayout()
+        sl_row.addWidget(QLabel('q  ='))
+        self._sl_q = QSlider(Qt.Orientation.Horizontal)
+        self._sl_q.setMinimum(0)
+        self._sl_q.setMaximum(0)
+        self._sl_q.setValue(0)
+        self._sl_q.setEnabled(False)
+        self._sl_q.valueChanged.connect(self._on_q_slider)
+        sl_row.addWidget(self._sl_q, 1)
+        self._lbl_q_val = QLabel('—')
+        self._lbl_q_val.setFixedWidth(170)
+        sl_row.addWidget(self._lbl_q_val)
+        right_lay.addLayout(sl_row)
 
         self._coord_lbl = QLabel()
         self._coord_lbl.setStyleSheet('font-family: monospace; color: #aaaaaa;')
+        self._coord_lbl.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                      QSizePolicy.Policy.Preferred)
         right_lay.addWidget(self._coord_lbl)
 
         splitter.addWidget(right)
+        splitter.setStretchFactor(1, 1)   # right panel: absorbs all extra space
         splitter.setSizes([420, 580])
 
         lay.addWidget(splitter, 1)
 
         self._ch = [add_crosshair(self._pw, label=self._coord_lbl)]
+        self._slice_crosshairs: list = []   # extended in _rebuild_slice_panels
 
         # ── Signal connections ────────────────────────────────────────────────
         self._btn_add.clicked.connect(self._add_files)
@@ -137,6 +248,12 @@ class DataTab(QWidget):
         self._table.itemChanged.connect(self._on_item_changed)
         self._table.currentItemChanged.connect(
             lambda cur, _: self._on_row_changed(cur.row() if cur else -1))
+        self._q_min.valueChanged.connect(self._update_slider_range)
+        self._q_max.valueChanged.connect(self._update_slider_range)
+        self._n_pts.valueChanged.connect(self._update_slider_range)
+
+        # Create initial single slice panel
+        self._rebuild_slice_panels(1)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _add_files(self):
@@ -207,6 +324,338 @@ class DataTab(QWidget):
     def _update_log(self):
         self._pw.setLogMode(x=self._chk_logx.isChecked(),
                             y=self._chk_logy.isChecked())
+        self._update_st_vline()
+
+    # ── Stuhrmann slice ───────────────────────────────────────────────────────
+    def _q_grid(self) -> np.ndarray | None:
+        active = [d for d in self._datasets if d.get('active', True)]
+        if not active:
+            return None
+        return np.linspace(self._q_min.value(), self._q_max.value(),
+                           int(self._n_pts.value()))
+
+    def _update_slider_range(self):
+        q = self._q_grid()
+        if q is None or len(q) == 0:
+            self._sl_q.setEnabled(False)
+            return
+        self._sl_q.setEnabled(True)
+        prev_max = self._sl_q.maximum()
+        self._sl_q.blockSignals(True)
+        self._sl_q.setMaximum(len(q) - 1)
+        if prev_max == 0:
+            self._sl_q.setValue(len(q) // 10)
+        self._sl_q.blockSignals(False)
+        self._on_q_slider(self._sl_q.value())
+
+    def _update_st_vline(self):
+        q = self._q_grid()
+        if q is None or len(q) == 0:
+            return
+        idx   = max(0, min(self._sl_q.value(), len(q) - 1))
+        q_val = q[idx]
+        if self._chk_logx.isChecked():
+            self._st_vline.setPos(np.log10(q_val))
+        else:
+            self._st_vline.setPos(q_val)
+
+    def _on_q_slider(self, idx: int):
+        q = self._q_grid()
+        if q is None or len(q) == 0:
+            return
+        idx   = max(0, min(idx, len(q) - 1))
+        q_val = q[idx]
+        self._lbl_q_val.setText(f'{q_val:.4f} Å⁻¹  [{idx + 1}/{len(q)}]')
+        self._update_st_vline()
+        self._update_stuhr_slice(q_val)
+
+    # ── Resonant element ──────────────────────────────────────────────────────
+    def _on_elem_chk_toggled(self, checked: bool, elem_idx: int):
+        """Enable/disable the combo for secondary elements."""
+        self._elem_combo[elem_idx].setEnabled(checked)
+        if not checked:
+            self._elem_Z[elem_idx] = 0
+            self._elem_shell[elem_idx] = ''
+            self._elem_fp[elem_idx] = np.array([])
+            self._elem_fpp[elem_idx] = np.array([])
+            self._elem_lbl_edge[elem_idx].setText('—')
+            self._elem_lbl_status[elem_idx].setText('')
+            self._rebuild_slice_panels(self._n_active_elems())
+            self._emit_fp_fpp()
+        else:
+            # Trigger a compute if already has a selection
+            if self._elem_Z[elem_idx] != 0:
+                self._compute_fp_fpp(elem_idx)
+
+    def _n_active_elems(self) -> int:
+        """Number of enabled element rows that have fp computed."""
+        return max(1, sum(
+            1 for i in range(3)
+            if (i == 0 or self._elem_chk[i].isChecked())
+            and len(self._elem_fp[i]) > 0
+        ))
+
+    def _update_element_presets(self, elem_idx: int = 0):
+        from .anomalous_tab import _edge_energy_keV, _SHELLS
+        try:
+            import xraydb
+        except ImportError:
+            return
+        active = [d for d in self._datasets
+                  if d.get('active', True) and d['energy'] is not None]
+        if not active:
+            return
+        energies = np.array([d['energy'] for d in active])
+        e_min, e_max = float(energies.min()), float(energies.max())
+        candidates = []
+        for Z in range(10, 93):
+            try:
+                sym = xraydb.atomic_symbol(Z)
+            except Exception:
+                continue
+            for shell in _SHELLS:
+                e_edge = _edge_energy_keV(Z, shell)
+                if e_edge <= 0 or not (e_min - 0.3 <= e_edge <= e_max + 0.3):
+                    continue
+                score = min(int(np.sum(energies > e_edge)),
+                            int(np.sum(energies < e_edge)))
+                label = f'{sym} ({Z}) — {shell}  [{e_edge:.4f} keV]'
+                candidates.append((score, Z, shell, label))
+        candidates.sort(key=lambda x: (-x[0], x[1]))
+        new_map = {lbl: (Z, sh) for _, Z, sh, lbl in candidates}
+
+        combo    = self._elem_combo[elem_idx]
+        prev_Z   = self._elem_Z[elem_idx]
+        prev_lbl = next((lbl for lbl, (Z, _) in new_map.items()
+                         if Z == prev_Z), None)
+
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem('(select element)')
+        for _, Z, shell, lbl in candidates:
+            combo.addItem(lbl)
+        self._preset_maps[elem_idx] = new_map
+
+        if prev_lbl:
+            idx = combo.findText(prev_lbl)
+            combo.setCurrentIndex(max(1, idx))
+            combo.blockSignals(False)
+            self._compute_fp_fpp(elem_idx)
+        elif candidates and (elem_idx == 0):
+            combo.setCurrentIndex(1)
+            combo.blockSignals(False)
+            _, Z, shell, _ = candidates[0]
+            self._elem_Z[elem_idx] = Z
+            self._elem_shell[elem_idx] = shell
+            self._update_edge_label(elem_idx)
+            self._compute_fp_fpp(elem_idx)
+        else:
+            combo.blockSignals(False)
+
+    def _update_edge_label(self, elem_idx: int):
+        from .anomalous_tab import _edge_energy_keV
+        e = _edge_energy_keV(self._elem_Z[elem_idx], self._elem_shell[elem_idx])
+        self._elem_lbl_edge[elem_idx].setText(f'{e:.4f} keV' if e else '—')
+
+    def _on_element_preset(self, idx: int, elem_idx: int):
+        if idx == 0:
+            self._elem_fp[elem_idx] = np.array([])
+            self._elem_fpp[elem_idx] = np.array([])
+            self._elem_Z[elem_idx] = 0
+            self._elem_shell[elem_idx] = ''
+            self._elem_lbl_edge[elem_idx].setText('—')
+            self._elem_lbl_status[elem_idx].setText('')
+            self._rebuild_slice_panels(self._n_active_elems())
+            q = self._q_grid()
+            if q is not None:
+                self._update_stuhr_slice(
+                    q[max(0, min(self._sl_q.value(), len(q)-1))])
+            return
+        lbl = self._elem_combo[elem_idx].currentText()
+        if lbl not in self._preset_maps[elem_idx]:
+            return
+        Z, shell = self._preset_maps[elem_idx][lbl]
+        self._elem_Z[elem_idx] = Z
+        self._elem_shell[elem_idx] = shell
+        self._update_edge_label(elem_idx)
+        self._compute_fp_fpp(elem_idx)
+
+    def _compute_fp_fpp(self, elem_idx: int):
+        from .anomalous_tab import _fp_fpp
+        from .core.decompose import condition_number
+        Z = self._elem_Z[elem_idx]
+        if Z == 0:
+            return
+        active = [d for d in self._datasets
+                  if d.get('active', True) and d['energy'] is not None]
+        if not active:
+            return
+        energies = np.array([d['energy'] for d in active])
+        try:
+            fp, fpp = _fp_fpp(Z, energies)
+        except Exception as e:
+            self._elem_lbl_status[elem_idx].setText(f'Error: {e}')
+            self._elem_lbl_status[elem_idx].setStyleSheet(
+                'color: #e57373; font-size: 11px;')
+            return
+        self._elem_fp[elem_idx]  = fp
+        self._elem_fpp[elem_idx] = fpp
+        kappa = condition_number(fp, fpp)
+        self._elem_lbl_status[elem_idx].setText(f"f' ready  |  κ = {kappa:.1f}")
+        self._elem_lbl_status[elem_idx].setStyleSheet(
+            'color: #81c784; font-size: 11px;')
+        self._rebuild_slice_panels(self._n_active_elems())
+        self._emit_fp_fpp()
+        q = self._q_grid()
+        if q is not None:
+            self._update_stuhr_slice(
+                q[max(0, min(self._sl_q.value(), len(q)-1))])
+
+    def _compute_all_fp_fpp(self):
+        for i in range(3):
+            if i == 0 or self._elem_chk[i].isChecked():
+                self._compute_fp_fpp(i)
+
+    def _emit_fp_fpp(self):
+        """Collect active elements and emit fp_fpp_ready."""
+        elems = self.active_elements
+        if elems:
+            self.fp_fpp_ready.emit(elems)
+
+    @property
+    def current_Z(self) -> int:
+        """Backward compat — returns primary element Z."""
+        return self._elem_Z[0]
+
+    @property
+    def active_elements(self) -> list:
+        """List of dicts {'Z','label','fp','fpp'} for active elements with computed fp."""
+        result = []
+        for i in range(3):
+            if i != 0 and not self._elem_chk[i].isChecked():
+                continue
+            if len(self._elem_fp[i]) == 0:
+                continue
+            try:
+                import xraydb
+                sym = xraydb.atomic_symbol(self._elem_Z[i])
+            except Exception:
+                sym = f'Z{self._elem_Z[i]}'
+            result.append({
+                'Z':     self._elem_Z[i],
+                'label': f'{sym} (elem {i+1})',
+                'fp':    self._elem_fp[i],
+                'fpp':   self._elem_fpp[i],
+            })
+        return result
+
+    @property
+    def active_energies(self) -> np.ndarray:
+        return np.array([d['energy'] for d in self._datasets
+                         if d.get('active', True) and d['energy'] is not None])
+
+    # ── Slice panels ──────────────────────────────────────────────────────────
+    def _on_slice_logy_toggled(self, v: bool):
+        for pw in self._slice_panels:
+            pw.setLogMode(x=False, y=v)
+
+    def _rebuild_slice_panels(self, n: int):
+        """Rebuild n PlotWidget panels in the right vertical splitter."""
+        # Remove all existing panels
+        for pw in self._slice_panels:
+            self._stuhr_right_split.widget(
+                self._stuhr_right_split.indexOf(pw)
+            ) if self._stuhr_right_split.indexOf(pw) >= 0 else None
+        # Simpler: remove children from splitter
+        while self._stuhr_right_split.count() > 0:
+            w = self._stuhr_right_split.widget(0)
+            w.setParent(None)
+        self._slice_panels.clear()
+        self._slice_items.clear()
+        self._slice_crosshairs.clear()
+
+        n = max(1, n)
+        for i in range(n):
+            pw = pg.PlotWidget(
+                title=f"Element {i+1} — I vs f'₁" if n > 1
+                      else "Stuhrmann: I(q, E) vs f'(E)  at selected q")
+            pw.setLabel('bottom', "f'  (e)" if len(self._elem_fp[i]) > 0
+                        else 'Energy (keV)')
+            pw.setLabel('left', 'I(q, E)  (cm⁻¹)')
+            pw.setLogMode(x=False, y=self._chk_slice_logy.isChecked())
+            self._stuhr_right_split.addWidget(pw)
+            self._slice_panels.append(pw)
+            self._slice_items.append([])
+            ch = add_crosshair(pw, label=self._coord_lbl)
+            self._slice_crosshairs.append(ch)
+
+        if n > 1:
+            sz = 300 // n
+            self._stuhr_right_split.setSizes([sz] * n)
+
+    def _update_stuhr_slice(self, q_val: float):
+        """Plot I(q_val, E) vs f'_i(E) in each panel."""
+        if not self._slice_panels:
+            self._rebuild_slice_panels(1)
+
+        active = [d for d in self._datasets
+                  if d.get('active', True) and d['energy'] is not None]
+        if not active:
+            return
+
+        # Determine which elements have data for panels
+        panel_elems: list[tuple[int, np.ndarray]] = []  # (elem_idx, fp_arr)
+        for i in range(3):
+            if i != 0 and not self._elem_chk[i].isChecked():
+                continue
+            fp_i = self._elem_fp[i]
+            if len(fp_i) == len(active):
+                panel_elems.append((i, fp_i))
+            elif i == 0:
+                # Fallback to energy axis for primary if fp not ready
+                panel_elems.append((i, None))
+
+        n = max(1, len(panel_elems))
+        if n != len(self._slice_panels):
+            self._rebuild_slice_panels(n)
+
+        total = len(active)
+        for panel_idx, (elem_i, fp_arr) in enumerate(panel_elems):
+            pw = self._slice_panels[panel_idx]
+            # Clear old items
+            for item in self._slice_items[panel_idx]:
+                pw.removeItem(item)
+            self._slice_items[panel_idx].clear()
+
+            if fp_arr is not None:
+                x_vals = fp_arr
+                pw.setLabel('bottom', f"f'  (e) — elem {elem_i+1}")
+                title_suffix = f"f'₁(E)" if n <= 1 else f"f'_{elem_i+1}(E)"
+                pw.setTitle(f"Element {elem_i+1} — I vs {title_suffix}  at q")
+            else:
+                x_vals = np.array([d['energy'] for d in active])
+                pw.setLabel('bottom', 'Energy (keV)')
+                pw.setTitle('I(q, E)  vs  energy  at selected q')
+
+            for k, (ds, x) in enumerate(zip(active, x_vals)):
+                I_at_q   = float(np.interp(q_val, ds['q'], ds['I']))
+                sig_at_q = float(np.interp(q_val, ds['q'], ds['sigma']))
+                if I_at_q <= 0:
+                    continue
+                t   = k / max(total - 1, 1)
+                col = pg.mkColor(*_energy_color(t))
+                pt = pg.ScatterPlotItem(x=[x], y=[I_at_q], size=10,
+                                        pen=pg.mkPen(col), brush=pg.mkBrush(col))
+                pw.addItem(pt)
+                self._slice_items[panel_idx].append(pt)
+                if sig_at_q > 0:
+                    ei = pg.ErrorBarItem(
+                        x=np.array([x]), y=np.array([I_at_q]),
+                        top=np.array([sig_at_q]), bottom=np.array([sig_at_q]),
+                        pen=pg.mkPen(col, width=1.0))
+                    pw.addItem(ei)
+                    self._slice_items[panel_idx].append(ei)
+            pw.setLogMode(x=False, y=self._chk_slice_logy.isChecked())
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _row_color(self, idx: int, total: int) -> tuple[int, int, int]:
@@ -299,6 +748,9 @@ class DataTab(QWidget):
     def _emit_active(self):
         active = [d for d in self._datasets if d.get('active', True)]
         self.datasets_changed.emit(active)
+        self._update_slider_range()
+        for i in range(3):
+            self._update_element_presets(i)
 
     # ── Public API ────────────────────────────────────────────────────────────
     def get_common_grid(self) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:

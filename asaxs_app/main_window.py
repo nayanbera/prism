@@ -42,7 +42,7 @@ class MainWindow(QMainWindow):
 
         # ── Signal wiring ─────────────────────────────────────────────────────
         self._data_tab.datasets_changed.connect(self._on_datasets_changed)
-        self._anom_tab.fp_fpp_ready.connect(self._on_fp_fpp)
+        self._data_tab.fp_fpp_ready.connect(self._on_fp_fpp)
         self._decomp_tab.decomposition_done.connect(self._on_decomposition_done)
         self._decomp_tab.reference_loaded.connect(self._rspace_tab.set_reference_partials)
         self._ift_tab.ift_done.connect(self._on_ift_done)
@@ -51,7 +51,6 @@ class MainWindow(QMainWindow):
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _on_datasets_changed(self, datasets: list):
         energies = [d['energy'] for d in datasets]
-        self._anom_tab.set_energies(energies)
 
         if len(datasets) >= 3:
             result = self._data_tab.get_common_grid()
@@ -63,9 +62,13 @@ class MainWindow(QMainWindow):
                     f'{len(datasets)} datasets — q: {q[0]:.4f}–{q[-1]:.4f} Å⁻¹ '
                     f'({len(q)} pts)', 5000)
 
-    def _on_fp_fpp(self, fp: np.ndarray, fpp: np.ndarray):
-        self._decomp_tab.set_fp_fpp(fp, fpp)
+    def _on_fp_fpp(self, elements: list):
+        """Receive list of {'Z','label','fp','fpp'} dicts from DataTab."""
+        fp  = elements[0]['fp']  if elements else np.array([])
+        fpp = elements[0]['fpp'] if elements else np.array([])
+        self._decomp_tab.set_elements(elements)
         self._rspace_tab.set_fp_fpp(fp, fpp)
+        self._anom_tab.display(self._data_tab.active_energies, elements)
         self._status.showMessage("f'/f'' ready — run decomposition in tab 3 or 4", 4000)
 
     def _on_decomposition_done(self, q, I_MM, I_RM, I_RR, s_MM, s_RM, s_RR):
