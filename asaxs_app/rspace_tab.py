@@ -202,7 +202,7 @@ class RSpaceTab(QWidget):
         self._pw_fit = pg.PlotWidget(title='Back-transform: K·p(r) vs I(q)')
         self._pw_fit.setLabel('bottom', 'q (Å⁻¹)')
         self._pw_fit.setLabel('left', '|I(q)| (cm⁻¹)')
-        self._pw_fit.setLogMode(x=False, y=True)
+        self._pw_fit.setLogMode(x=True, y=True)
         self._pw_fit.addLegend()
         self._fit_curves: list = []
         # Reference partial overlays (dashed) — populated by set_reference_partials()
@@ -638,9 +638,9 @@ class RSpaceTab(QWidget):
         self._pw_gamma.setXRange(0, r_lim, padding=0.02)
 
         # R_g of resonant component (label updated later with lognormal info)
-        norm = np.trapezoid(p_RR, r)
+        norm = np.trapz(p_RR, r)
         if norm > 1e-30:
-            Rg2 = np.trapezoid(r**2 * p_RR, r) / (2.0 * norm)
+            Rg2 = np.trapz(r**2 * p_RR, r) / (2.0 * norm)
             _Rg = float(np.sqrt(max(Rg2, 0.0)))
         else:
             _Rg = None
@@ -700,7 +700,7 @@ class RSpaceTab(QWidget):
         # ── Size distribution P(R) = -d(ρ_R_norm)/dr ─────────────────────────
         P_R = -np.gradient(rho_R, r_show)
         P_R = np.maximum(P_R, 0.0)
-        norm_P = float(np.trapezoid(P_R, r_show))
+        norm_P = float(np.trapz(P_R, r_show))
         if norm_P > 0:
             P_R = P_R / norm_P
 

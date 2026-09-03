@@ -6,6 +6,7 @@ Difference mode — subtract reference energy E_ref → I_RM, I_RR only
                   (I_MM cancels; more robust, lower κ)
 """
 
+import re
 import numpy as np
 from pathlib import Path
 from PyQt6.QtWidgets import (
@@ -20,7 +21,8 @@ from .core.crosshair import add_crosshair
 from .core.decompose import (
     decompose, decompose_difference, stuhrmann_analysis, condition_number,
     cauchy_schwarz_ratio, enforce_cauchy_schwarz,
-    decompose_multi, build_A_multi, condition_number_multi,
+    decompose_multi, decompose_multi_per_edge, build_A_multi, condition_number_multi,
+    compute_edge_groups, compute_edge_groups_by_energy, estimate_normalization_lowq,
 )
 
 _COLORS = {'I_MM': '#2196F3', 'I_RM': '#4CAF50', 'I_RR': '#F44336'}
@@ -118,6 +120,16 @@ class DecompositionTab(QWidget):
         self._btn_lp.clicked.connect(self._run_lp_bounds)
         top.addWidget(self._btn_lp)
 
+        self._chk_norm_opt = QCheckBox('Normalize cross-edge')
+        self._chk_norm_opt.setToolTip(
+            'Show cross-edge normalization controls (second row).\n'
+            'Set β₂ / β₃ to correct for different absolute scales between edge\n'
+            'measurements.  I_edge_i(q,E) is divided by βᵢ before the WLS solve.\n'
+            'Direct mode, multi-element only.')
+        top.addWidget(self._chk_norm_opt)
+
+        self._chk_norm_opt.toggled.connect(self._on_norm_opt_toggled)
+
         top.addStretch()
         self._btn_ref = QPushButton('Load reference partials…')
         self._btn_ref.clicked.connect(self._load_reference)
@@ -132,6 +144,62 @@ class DecompositionTab(QWidget):
         top.addWidget(self._lbl_status)
         lay.addLayout(top)
 
+        # ── Cross-edge normalisation row (hidden until checkbox is ticked) ──────
+        from PyQt6.QtWidgets import QDoubleSpinBox as _BSPIN, QFrame
+        self._beta_row = QWidget()
+        beta_lay = QHBoxLayout(self._beta_row)
+        beta_lay.setContentsMargins(6, 2, 6, 2)
+
+        beta_lay.addWidget(QLabel('Cross-edge β:'))
+
+        beta_lay.addWidget(QLabel('β₂ ='))
+        self._beta_spin_2 = _BSPIN()
+        self._beta_spin_2.setDecimals(4)
+        self._beta_spin_2.setRange(0.01, 100.0)
+        self._beta_spin_2.setValue(1.0)
+        self._beta_spin_2.setFixedWidth(80)
+        self._beta_spin_2.setToolTip(
+            'Normalization for element 2.  I₂(q,E) is divided by this value\n'
+            'before the WLS solve.  1.0 = no change.')
+        beta_lay.addWidget(self._beta_spin_2)
+
+        self._beta_lbl_3 = QLabel('β₃ =')
+        self._beta_spin_3 = _BSPIN()
+        self._beta_spin_3.setDecimals(4)
+        self._beta_spin_3.setRange(0.01, 100.0)
+        self._beta_spin_3.setValue(1.0)
+        self._beta_spin_3.setFixedWidth(80)
+        self._beta_spin_3.setToolTip(
+            'Normalization for element 3.  I₃(q,E) is divided by this value\n'
+            'before the WLS solve.  1.0 = no change.')
+        self._beta_lbl_3.setVisible(False)
+        self._beta_spin_3.setVisible(False)
+        beta_lay.addWidget(self._beta_lbl_3)
+        beta_lay.addWidget(self._beta_spin_3)
+
+        self._btn_est_beta = QPushButton('Estimate from low-q')
+        self._btn_est_beta.setToolTip(
+            'Fill β values from the low-q intensity ratio (assumes I(q_low) ≈ I_MM).\n'
+            'UNRELIABLE when |2·f\'·I_RM| is comparable to I_MM at low q.\n'
+            'Use as a starting point and verify via the Stuhrmann panels.')
+        self._btn_est_beta.clicked.connect(self._estimate_beta_clicked)
+        beta_lay.addWidget(self._btn_est_beta)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        beta_lay.addWidget(sep)
+
+        self._beta_hint = QLabel(
+            'Set β₂ from monitor count ratio or absolute flux calibration.  '
+            '1.0 = no correction.')
+        self._beta_hint.setStyleSheet('color: #888888; font-size: 11px;')
+        beta_lay.addWidget(self._beta_hint)
+        beta_lay.addStretch()
+
+        self._beta_row.setVisible(False)
+        lay.addWidget(self._beta_row)
+
         # ── Tab: I(q) plot / Stuhrmann ────────────────────────────────────────
         inner = QTabWidget()
 
@@ -139,26 +207,38 @@ class DecompositionTab(QWidget):
         self._pw_iq = pg.PlotWidget(title='Partial structure factors I(q)')
         self._pw_iq.setLabel('bottom', 'q (Å⁻¹)')
         self._pw_iq.setLabel('left', 'I(q) (cm⁻¹)')
-        self._pw_iq.addLegend()
+        _iq_legend = self._pw_iq.addLegend()
         self._pw_iq.setLogMode(x=True, y=True)
-        self._curves_iq: dict[str, pg.PlotDataItem] = {}
-        self._err_items: dict[str, pg.ErrorBarItem] = {}
+        # Use PlotCurveItem (not PlotDataItem) so we can apply log10 manually
+        # and use connect='finite' reliably — PlotDataItem does not forward
+        # connect='finite' to its inner PlotCurveItem in all PyQtGraph versions.
+        self._curves_iq:     dict[str, pg.PlotCurveItem]   = {}
+        self._curves_iq_neg: dict[str, pg.PlotCurveItem]   = {}
+        self._neg_markers:   dict[str, pg.ScatterPlotItem] = {}
+        self._err_items:     dict[str, pg.ErrorBarItem]    = {}
         for name, col in _COLORS.items():
-            self._curves_iq[name] = self._pw_iq.plot(
-                [], [], name=name, pen=pg.mkPen(col, width=2))
+            c = pg.PlotCurveItem(pen=pg.mkPen(col, width=2))
+            self._pw_iq.addItem(c)
+            _iq_legend.addItem(c, name)
+            self._curves_iq[name] = c
+            c_neg = pg.PlotCurveItem(
+                pen=pg.mkPen(col, width=1.5,
+                             style=pg.QtCore.Qt.PenStyle.DashLine))
+            self._pw_iq.addItem(c_neg)
+            self._curves_iq_neg[name] = c_neg
+            # Inverted triangles at negative data points (conventional log-plot sign marker)
+            m = pg.ScatterPlotItem(pen=pg.mkPen(None), brush=pg.mkBrush(col),
+                                   symbol='t1', size=7)
+            self._pw_iq.addItem(m)
+            self._neg_markers[name] = m
             ei = pg.ErrorBarItem(x=np.array([]), y=np.array([]),
                                  top=np.array([]), bottom=np.array([]),
                                  pen=pg.mkPen(col, width=0.8))
             self._pw_iq.addItem(ei)
             self._err_items[name] = ei
         self._raw_curves: list = []
-        # Dashed reference overlay — populated by _load_reference()
+        # Dashed reference overlay — populated dynamically by _load_reference()
         self._ref_iq_curves: dict[str, pg.PlotDataItem] = {}
-        for name, col in _COLORS.items():
-            self._ref_iq_curves[name] = self._pw_iq.plot(
-                [], [], name=f'{name} ref',
-                pen=pg.mkPen(col, width=1.5,
-                             style=pg.QtCore.Qt.PenStyle.DashLine))
 
         # LP bounds band for I_RR (shown after clicking "I_RR bounds (LP)")
         _lp_pen = pg.mkPen('#ff4444', width=1,
@@ -340,20 +420,77 @@ class DecompositionTab(QWidget):
         if n > 1:
             self._stuhr_right_split.setSizes([400] * n)
 
+    # Color scheme for reference partial curves
+    _REF_COLORS = {
+        'I_MM':   '#42A5F5',                         # blue 400
+        'I_R1M':  '#66BB6A', 'I_R2M': '#26C6DA', 'I_R3M': '#FFCA28',   # green, cyan, amber
+        'I_RM':   '#66BB6A',                         # legacy single-element alias
+        'I_R1R1': '#EF5350', 'I_R2R2': '#AB47BC', 'I_R3R3': '#FF7043', # red, purple, deep-orange
+        'I_RR':   '#EF5350',                         # legacy alias
+        'I_R1R2': '#FF9800', 'I_R1R3': '#26A69A', 'I_R2R3': '#EC407A', # orange, teal, pink
+    }
+
     def _load_reference(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, 'Load reference partials (q  I_MM  I_RM  I_RR)', '',
+            self, 'Load reference partials', '',
             'Data files (*.dat *.txt);;All files (*)')
         if not path:
             return
         try:
+            # Parse column names from header line "# q(1/A)  I_MM(cm-1)  ..."
+            col_names = []
+            with open(path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line.startswith('#'):
+                        break
+                    # Look for the header row that has q(1/A) and partial names
+                    if 'q(' in line or ('I_MM' in line and 'I_R' in line):
+                        parts = line.lstrip('#').split()
+                        col_names = [p.split('(')[0] for p in parts]
             data = np.loadtxt(path, comments='#')
-            q_ref, I_MM, I_RM, I_RR = data[:, 0], data[:, 1], data[:, 2], data[:, 3]
-            for name, arr in [('I_MM', I_MM), ('I_RM', np.abs(I_RM)), ('I_RR', I_RR)]:
-                self._ref_iq_curves[name].setData(q_ref, arr)
+            if data.ndim == 1:
+                data = data.reshape(1, -1)
+            q_ref = data[:, 0]
+
+            # Fall back to positional names if header parse failed
+            if len(col_names) != data.shape[1]:
+                from .core.decompose import partial_names_multi
+                n_partials = data.shape[1] - 1
+                # Guess n_elem: (n+1)(n+2)/2 = n_partials
+                for n_try in range(1, 4):
+                    if (n_try + 1) * (n_try + 2) // 2 == n_partials:
+                        col_names = ['q'] + partial_names_multi(n_try)
+                        break
+                else:
+                    col_names = ['q'] + [f'col_{i}' for i in range(1, data.shape[1])]
+
+            # Remove old reference curves from plot
+            for curve in self._ref_iq_curves.values():
+                self._pw_iq.removeItem(curve)
+            self._ref_iq_curves.clear()
+
+            # Create one dashed curve per partial column
+            for ci, name in enumerate(col_names[1:], start=1):
+                arr = np.abs(data[:, ci]) if 'RM' in name else data[:, ci]
+                col = self._REF_COLORS.get(name, '#888888')
+                curve = self._pw_iq.plot(
+                    q_ref, arr, name=f'{name} ref',
+                    pen=pg.mkPen(col, width=1.5,
+                                 style=pg.QtCore.Qt.PenStyle.DashLine))
+                self._ref_iq_curves[name] = curve
+
             self._toggle_ref_visibility(self._chk_show_ref.isChecked())
+
+            # Emit backward-compat signal with first-element partials
+            names = col_names[1:]
+            def _col(n): return data[:, col_names.index(n)] if n in col_names else np.zeros_like(q_ref)
+            I_MM = _col('I_MM')
+            I_RM = _col('I_R1M') if 'I_R1M' in col_names else _col('I_RM')
+            I_RR = _col('I_R1R1') if 'I_R1R1' in col_names else _col('I_RR')
             self.reference_loaded.emit(q_ref, I_MM, I_RM, I_RR)
-            self._lbl_status.setText(f'Reference: {Path(path).name}')
+            self._lbl_status.setText(
+                f'Reference: {Path(path).name}  ({len(names)} partials)')
         except Exception as e:
             self._lbl_status.setText(f'Reference load error: {e}')
 
@@ -362,15 +499,15 @@ class DecompositionTab(QWidget):
             curve.setVisible(visible)
 
     def _run_lp_bounds(self):
-        """Compute upper/lower bounds on I_RR at every q via linear programming.
+        """Compute upper/lower bounds on I_RiRi at every q via linear programming.
 
-        For each q, solve:
-            max/min  I_RR
-            s.t.     |A·x - I_meas| ≤ 1·σ  (model within 1σ of all measurements)
-                     I_MM ≥ 0,  I_RR ≥ 0
-        where x = (I_MM, I_RM, I_RR) and A is the ASAXS design matrix.
+        For each element i and each q, solve:
+            max/min  I_RiRi
+            s.t.     |A·x - I_meas| ≤ k·σ  (adaptive k)
+                     I_MM ≥ 0,  all I_RkRk ≥ 0,  I_RiRi ≥ I_RiM²/I_MM  (CS floor)
         """
         from scipy.optimize import linprog
+        from .core.decompose import build_A_multi, partial_names_multi
 
         if self._result is None or self._result.get('diff_mode', False):
             self._lbl_status.setText('LP bounds: direct mode only — run decomposition first')
@@ -378,60 +515,152 @@ class DecompositionTab(QWidget):
 
         r       = self._result
         q       = r['q']
-        fp      = self._fp
-        fpp     = self._fpp
-        I_mat   = r['I_raw']    # (NE, NQ)
-        sig_mat = r['sig_raw']  # (NE, NQ)
+        I_mat   = r['I_raw']
+        sig_mat = r['sig_raw']
         NQ      = len(q)
 
-        A       = np.column_stack([np.ones(len(fp)), 2*fp, fp**2 + fpp**2])
-        I_MM_w  = r['I_MM']   # WLS estimates — used to impose CS floor on I_RR
-        I_RM_w  = r['I_RM']
+        elems   = self._elements if self._elements else \
+                  [{'fp': self._fp, 'fpp': self._fpp}]
+        n_elems = len(elems)
 
-        lo_arr = np.full(NQ, np.nan)
-        hi_arr = np.full(NQ, np.nan)
+        if n_elems == 1:
+            fp  = elems[0].get('fp', self._fp)
+            fpp = elems[0].get('fpp', self._fpp)
+            A      = np.column_stack([np.ones(len(fp)), 2*fp, fp**2 + fpp**2])
+            names  = ['I_MM', 'I_R1M', 'I_R1R1']
+        else:
+            elem_pairs = [(e['fp'], e['fpp']) for e in elems]
+            A      = build_A_multi(elem_pairs, include_cross=False)
+            names  = partial_names_multi(n_elems, include_cross=False)
+
+        n_cols  = A.shape[1]
+        mm_idx  = names.index('I_MM')
+        rr_idxs = [names.index(f'I_R{i+1}R{i+1}') for i in range(n_elems)]
+        rm_idxs = [names.index(f'I_R{i+1}M')       for i in range(n_elems)]
+
+        # WLS estimates for CS floor
+        mr      = r.get('multi')
+        mr_parts = mr['partials'] if mr is not None else None
+        mr_names = mr['names']    if mr is not None else names
+
+        # Variable bounds template: I_MM ≥ 0, all I_RkRk ≥ 0, others free
+        base_bounds = [(None, None)] * n_cols
+        base_bounds[mm_idx] = (0, None)
+        for rr_idx in rr_idxs:
+            base_bounds[rr_idx] = (0, None)
+
+        all_lo = [np.full(NQ, np.nan) for _ in range(n_elems)]
+        all_hi = [np.full(NQ, np.nan) for _ in range(n_elems)]
 
         self._lbl_status.setText('Running LP bounds…')
         for j in range(NQ):
             I_meas = I_mat[:, j]
             sigma  = np.maximum(sig_mat[:, j], 1e-30)
-
-            # Adaptive k: use the WLS max normalised residual (+ 5% margin) so
-            # the feasible region always contains the WLS solution.  This keeps
-            # the band as tight as the data allow while guaranteeing feasibility.
             w      = 1.0 / sigma
             sol, *_ = np.linalg.lstsq(A * w[:, None], I_meas * w, rcond=None)
             k_j    = max(1.0, np.abs((A @ sol - I_meas) / sigma).max()) * 1.05
+            A_ub   = np.vstack([A, -A])
+            b_ub   = np.concatenate([I_meas + k_j*sigma, -(I_meas - k_j*sigma)])
 
-            # CS lower bound on I_RR: I_RR ≥ I_RM²/I_MM (from WLS estimates).
-            # Without this, the LP minimises I_RR by also driving I_RM→0,
-            # collapsing the CS floor along with it.
-            cs_lo = I_RM_w[j]**2 / max(abs(I_MM_w[j]), 1e-30)
+            for elem_i, rr_idx in enumerate(rr_idxs):
+                # CS floor for this element using WLS estimates
+                if mr_parts is not None:
+                    I_RiM_w = float(mr_parts[mr_names.index(f'I_R{elem_i+1}M'), j])
+                    I_MM_w  = float(mr_parts[mr_names.index('I_MM'), j])
+                else:
+                    I_RiM_w = float(r['I_RM'][j])
+                    I_MM_w  = float(r['I_MM'][j])
+                cs_lo = I_RiM_w**2 / max(abs(I_MM_w), 1e-30)
 
-            bounds = [(0, None), (None, None), (max(0.0, cs_lo), None)]
+                var_bounds = list(base_bounds)
+                var_bounds[rr_idx] = (max(0.0, cs_lo), None)
 
-            A_ub = np.vstack([ A, -A])
-            b_ub = np.concatenate([I_meas + k_j*sigma, -(I_meas - k_j*sigma)])
+                c_lo = [0.0] * n_cols; c_lo[rr_idx] =  1.0
+                c_hi = [0.0] * n_cols; c_hi[rr_idx] = -1.0
 
-            res_lo = linprog([0, 0,  1], A_ub=A_ub, b_ub=b_ub,
-                             bounds=bounds, method='highs')
-            res_hi = linprog([0, 0, -1], A_ub=A_ub, b_ub=b_ub,
-                             bounds=bounds, method='highs')
-            if res_lo.status == 0:
-                lo_arr[j] = res_lo.fun
-            if res_hi.status == 0:
-                hi_arr[j] = -res_hi.fun
+                res_lo = linprog(c_lo, A_ub=A_ub, b_ub=b_ub, bounds=var_bounds, method='highs')
+                res_hi = linprog(c_hi, A_ub=A_ub, b_ub=b_ub, bounds=var_bounds, method='highs')
+                if res_lo.status == 0:
+                    all_lo[elem_i][j] = res_lo.fun
+                if res_hi.status == 0:
+                    all_hi[elem_i][j] = -res_hi.fun
 
-        valid   = np.isfinite(lo_arr) & np.isfinite(hi_arr) & (hi_arr > 0)
-        lo_plot = np.maximum(lo_arr[valid], 1e-12)   # floor to avoid log(-inf)
-        hi_plot = hi_arr[valid]
+        # Remove old extra bands for elements 1+
+        for item in getattr(self, '_extra_lp_items', []):
+            try:
+                self._pw_iq.removeItem(item)
+            except Exception:
+                pass
+        self._extra_lp_items = []
 
-        self._curve_lp_lo.setData(q[valid], lo_plot)
-        self._curve_lp_hi.setData(q[valid], hi_plot)
+        lp_colors = ['#ff4444', '#FF9800', '#9C27B0']
 
-        n_ok = valid.sum()
+        # Element 0: existing curves
+        valid0  = np.isfinite(all_lo[0]) & np.isfinite(all_hi[0]) & (all_hi[0] > 0)
+        self._curve_lp_lo.setData(q[valid0], np.maximum(all_lo[0][valid0], 1e-12))
+        self._curve_lp_hi.setData(q[valid0], all_hi[0][valid0])
+
+        # Elements 1+: create new curves
+        for elem_i in range(1, n_elems):
+            col   = lp_colors[elem_i % len(lp_colors)]
+            pen   = pg.mkPen(col, width=1, style=pg.QtCore.Qt.PenStyle.DotLine)
+            valid_i = np.isfinite(all_lo[elem_i]) & np.isfinite(all_hi[elem_i]) & (all_hi[elem_i] > 0)
+            lo_i  = np.maximum(all_lo[elem_i][valid_i], 1e-12)
+            hi_i  = all_hi[elem_i][valid_i]
+            c_lo  = self._pw_iq.plot(q[valid_i], lo_i, pen=pen)
+            c_hi  = self._pw_iq.plot(q[valid_i], hi_i, pen=pen,
+                                     name=f'I_R{elem_i+1}R{elem_i+1} LP bounds')
+            r_col = pg.mkColor(col).getRgb()[:3]
+            fill  = pg.FillBetweenItem(c_lo, c_hi, brush=pg.mkBrush(*r_col, 45))
+            self._pw_iq.addItem(fill)
+            self._extra_lp_items.extend([c_lo, c_hi, fill])
+
+        n_ok = sum(int((np.isfinite(all_lo[i]) & np.isfinite(all_hi[i])).sum())
+                   for i in range(n_elems))
         self._lbl_status.setText(
-            f'LP bounds done ({n_ok}/{NQ} q-points feasible, adaptive-k band)')
+            f'LP bounds done ({n_elems} element(s), {n_ok} feasible q-pts, adaptive-k)')
+
+    # ── Cross-edge normalization helpers ──────────────────────────────────────
+    def _on_norm_opt_toggled(self, checked: bool):
+        n_elems = len(self._elements) if self._elements else 1
+        self._beta_row.setVisible(checked)
+        self._beta_lbl_3.setVisible(n_elems >= 3)
+        self._beta_spin_3.setVisible(n_elems >= 3)
+
+    def _estimate_beta_clicked(self):
+        if self._q is None or self._I_matrix is None or not self._elements:
+            return
+        n_elems = len(self._elements)
+        if n_elems <= 1:
+            return
+        elems = [(e['fp'], e['fpp']) for e in self._elements]
+        qmask = ((self._q >= self._spin_qmin.value()) &
+                 (self._q <= self._spin_qmax.value()))
+        q_m = self._q[qmask]
+        I_m = self._I_matrix[:, qmask]
+        # Assign energies by proximity to each element's edge energy.
+        # compute_edge_groups (argmax fpp) is unreliable with tabulated f''
+        # because the white-line enhancement is absent.
+        energies_keV = np.array(self._energies) if self._energies else None
+        if energies_keV is not None and len(energies_keV) == len(elems[0][0]):
+            elem_meta = [{'Z': e.get('Z', 0), 'shell': e.get('shell', '')}
+                         for e in self._elements]
+            edge_groups = compute_edge_groups_by_energy(elem_meta, energies_keV)
+        else:
+            edge_groups = compute_edge_groups(elems)
+        try:
+            beta = estimate_normalization_lowq(q_m, I_m, edge_groups)
+        except Exception as exc:
+            self._beta_hint.setText(f'Estimate failed: {exc}')
+            self._beta_hint.setStyleSheet('color: #ff6666; font-size: 11px;')
+            return
+        if n_elems >= 2:
+            self._beta_spin_2.setValue(float(beta[1]))
+        if n_elems >= 3:
+            self._beta_spin_3.setValue(float(beta[2]))
+        parts = ', '.join(f'β{i+1}={b:.4f}' for i, b in enumerate(beta))
+        self._beta_hint.setText(f'Estimated: {parts}  — click Run decomposition to apply')
+        self._beta_hint.setStyleSheet('color: #aed581; font-size: 11px;')
 
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _run(self):
@@ -443,6 +672,11 @@ class DecompositionTab(QWidget):
                 f'Mismatch: {len(self._fp)} f\' values vs '
                 f'{self._I_matrix.shape[0]} datasets')
             return
+        n_elems = len(self._elements) if self._elements else 1
+        if n_elems == 1:
+            self._lbl_status.setText(
+                'Running with 1 resonant element — '
+                'compute f\'/f\'\' for all elements in the Data tab first for multi-element decomp')
 
         diff_mode = self._chk_diff.isChecked()
         ref_idx   = self._combo_ref.currentIndex()
@@ -467,11 +701,54 @@ class DecompositionTab(QWidget):
                 s_MM = np.zeros_like(I_RM)
                 # Multi-element result (diff mode — use element 0 only)
                 multi_result = None
+                beta_opt     = None
+                edge_groups  = None
             else:
                 # Always use decompose_multi for consistency
                 elems = [(e['fp'], e['fpp']) for e in self._elements] \
                         if self._elements else [(self._fp, self._fpp)]
-                mr = decompose_multi(q, I, sig, elems)
+
+                # Build edge groups for N>1 (per-edge decomp + beta normalization)
+                edge_groups_all = None
+                if n_elems > 1:
+                    energies_keV = np.array(self._energies) if self._energies else None
+                    if (energies_keV is not None
+                            and len(energies_keV) == len(elems[0][0])):
+                        elem_meta = [{'Z': e.get('Z', 0), 'shell': e.get('shell', '')}
+                                     for e in self._elements]
+                        edge_groups_all = compute_edge_groups_by_energy(
+                            elem_meta, energies_keV)
+                    else:
+                        edge_groups_all = compute_edge_groups(elems)
+
+                # Optional cross-edge normalization (manual β from spin boxes)
+                beta_opt    = None
+                edge_groups = None   # stored in result; only set when beta active
+                if n_elems > 1 and self._chk_norm_opt.isChecked():
+                    beta_vals = [1.0]
+                    if n_elems >= 2:
+                        beta_vals.append(self._beta_spin_2.value())
+                    if n_elems >= 3:
+                        beta_vals.append(self._beta_spin_3.value())
+                    while len(beta_vals) < n_elems:
+                        beta_vals.append(1.0)
+                    beta_opt = np.array(beta_vals[:n_elems])
+                    if np.allclose(beta_opt, 1.0, atol=1e-6):
+                        beta_opt = None
+                    else:
+                        edge_groups = edge_groups_all  # activate display scaling
+
+                # Global WLS with per-edge offsets + cross-terms for N>1.
+                # Per-edge offsets handle cross-edge absolute scale mismatch;
+                # include_cross=True eliminates the systematic bias in I_RiRi
+                # caused by unmodelled cross-terms bleeding into diagonal partials.
+                if n_elems > 1 and edge_groups_all is not None:
+                    mr = decompose_multi_per_edge(q, I, sig, elems,
+                                                  edge_groups_all, beta=beta_opt,
+                                                  include_cross=(n_elems > 1))
+                else:
+                    mr = decompose_multi(q, I, sig, elems,
+                                         beta=beta_opt, edge_groups=edge_groups)
                 # Extract element-0 partials for backward compat
                 names = mr['names']
                 parts = mr['partials']
@@ -513,6 +790,9 @@ class DecompositionTab(QWidget):
             I_raw=I,      # masked intensity
             sig_raw=sig,  # masked sigma — needed for LP bounds
             multi=multi_result,   # full multi-element result (None in diff mode)
+            beta=beta_opt,        # normalization factors (None if not optimized)
+            edge_groups=edge_groups,
+            edge_groups_all=edge_groups_all if n_elems > 1 else None,
         )
 
         self._update_iq_plot()
@@ -530,9 +810,13 @@ class DecompositionTab(QWidget):
         else:
             cs_str = f'  |  C-S: {n_viol}/{len(q)} violated'
         n_elems = len(self._elements) if self._elements else 1
+        if beta_opt is not None:
+            beta_str = '  |  β=[' + ', '.join(f'{b:.4f}' for b in beta_opt) + ']'
+        else:
+            beta_str = ''
         self._lbl_status.setText(
             f'Done [{mode}, {n_elems} elem] — {self._I_matrix.shape[0]} energies, '
-            f'{len(q)} q-points  |  {kappa_str}{cs_str}')
+            f'{len(q)} q-points  |  {kappa_str}{cs_str}{beta_str}')
 
     def _update_iq_plot(self):
         r = self._result
@@ -547,19 +831,35 @@ class DecompositionTab(QWidget):
                 pen=pg.mkPen((160, 160, 160, 60), width=0.8))
             self._raw_curves.append(c)
 
+        # PlotCurveItem does not auto-apply log transform — we do it manually
+        # so connect='finite' reliably creates gaps at nan (sign crossings).
+        log_y = self._chk_log.isChecked()
+        lq = np.log10(q)   # x is always log
+
         # Always plot the 3 base partials (elem 0) with standard colors
+        # Negative values shown as dashed with |value| so sign is visible on log scale
         for name, key_I, key_s in [
             ('I_MM', 'I_MM', 's_MM'),
             ('I_RM', 'I_RM', 's_RM'),
             ('I_RR', 'I_RR', 's_RR'),
         ]:
             Iq = r[key_I]
-            self._curves_iq[name].setData(q, np.maximum(np.abs(Iq), 1e-40))
+            y_abs = np.maximum(np.abs(Iq), 1e-40)
+            pos = Iq >= 0
+            yv = np.log10(y_abs) if log_y else y_abs
+            # Mask negative values — gap in log plot signals sign flip
+            self._curves_iq[name].setData(lq, np.where(pos, yv, np.nan),
+                                          connect='finite')
+            self._curves_iq_neg[name].setData([], [])
+            self._neg_markers[name].setData([], [])
 
-        # Additional curves for N>1 elements (remove old ones first)
+        # Additional curves + error bars for N>1 elements (remove old ones first)
         for c in getattr(self, '_extra_iq_curves', []):
             self._pw_iq.removeItem(c)
         self._extra_iq_curves = []
+        for _, _, ei in getattr(self, '_extra_err_meta', []):
+            self._pw_iq.removeItem(ei)
+        self._extra_err_meta = []   # list of (name, mr_idx, ErrorBarItem)
 
         mr = r.get('multi')
         if mr is not None and len(mr['names']) > 3:
@@ -572,9 +872,19 @@ class DecompositionTab(QWidget):
                 Iq = mr['partials'][idx]
                 col = extra_colors[ec_idx % len(extra_colors)]
                 ec_idx += 1
-                c = self._pw_iq.plot(q, np.maximum(np.abs(Iq), 1e-40),
-                                     name=name, pen=pg.mkPen(col, width=2))
-                self._extra_iq_curves.append(c)
+                y_abs = np.maximum(np.abs(Iq), 1e-40)
+                pos = Iq >= 0
+                yv = np.log10(y_abs) if log_y else y_abs
+                c_pos = pg.PlotCurveItem(
+                    lq, np.where(pos, yv, np.nan),
+                    name=name, pen=pg.mkPen(col, width=2), connect='finite')
+                self._pw_iq.addItem(c_pos)
+                self._extra_iq_curves.append(c_pos)
+                ei = pg.ErrorBarItem(x=np.array([]), y=np.array([]),
+                                     top=np.array([]), bottom=np.array([]),
+                                     pen=pg.mkPen(col, width=0.8))
+                self._pw_iq.addItem(ei)
+                self._extra_err_meta.append((name, idx, ei))
 
         self._refresh_errorbars()
         self._update_cs_plot()
@@ -615,7 +925,8 @@ class DecompositionTab(QWidget):
             ('I_RM', 'I_RM', 's_RM'),
             ('I_RR', 'I_RR', 's_RR'),
         ]:
-            Iq  = np.maximum(np.abs(r[key_I]), 1e-40)
+            raw_Iq = r[key_I]
+            Iq  = np.maximum(np.abs(raw_Iq), 1e-40)
             si  = r[key_s]
 
             # For I_RR clip the bottom bar at the CS floor so it never extends
@@ -626,14 +937,17 @@ class DecompositionTab(QWidget):
                 bot = si
 
             if show:
-                # Only plot where the bottom bar has positive extent.
-                ok = bot > 0
+                # Only plot where the bottom bar has positive extent AND value is positive
+                # (negative values are masked from the log plot, so hide their bars too).
+                ok = (bot > 0) & (raw_Iq >= 0)
                 if log:
                     # ErrorBarItem is a raw ViewBox item — needs log10 coords.
-                    lq  = np.log10(q[ok])
-                    lIq = np.log10(Iq[ok])
-                    top    = np.log10(Iq[ok] + si[ok]) - lIq
-                    bottom = lIq - np.log10(Iq[ok] - bot[ok])
+                    # Also require Iq > bot so log10(Iq - bot) stays finite.
+                    ok_log = ok & (Iq > bot)
+                    lq  = np.log10(q[ok_log])
+                    lIq = np.log10(Iq[ok_log])
+                    top    = np.log10(Iq[ok_log] + si[ok_log]) - lIq
+                    bottom = lIq - np.log10(Iq[ok_log] - bot[ok_log])
                     self._err_items[name].setData(
                         x=lq, y=lIq, top=top, bottom=bottom)
                 else:
@@ -644,9 +958,57 @@ class DecompositionTab(QWidget):
                     x=np.array([]), y=np.array([]),
                     top=np.array([]), bottom=np.array([]))
 
+        # Extra components for N>1 elements
+        mr = r.get('multi')
+        empty = np.array([])
+        I_MM_g = mr['partials'][mr['names'].index('I_MM')] if mr is not None else None
+        for comp_name, mr_idx, ei in getattr(self, '_extra_err_meta', []):
+            if not show or mr is None:
+                ei.setData(x=empty, y=empty, top=empty, bottom=empty)
+                continue
+            raw_Iq = mr['partials'][mr_idx]
+            si     = mr['errors'][mr_idx]
+            Iq     = np.maximum(np.abs(raw_Iq), 1e-40)
+
+            # CS floor for I_RiRi components: bottom bar ≥ I_RiM² / |I_MM|
+            rr_match = re.fullmatch(r'I_R(\d+)R\1', comp_name)
+            if rr_match and I_MM_g is not None:
+                i_str    = rr_match.group(1)
+                rm_name  = f'I_R{i_str}M'
+                if rm_name in mr['names']:
+                    I_RiM_g  = mr['partials'][mr['names'].index(rm_name)]
+                    cs_floor = I_RiM_g**2 / np.maximum(np.abs(I_MM_g), 1e-30)
+                    bot = np.minimum(si, np.maximum(Iq - cs_floor, 0.0))
+                else:
+                    bot = si
+            else:
+                bot = si
+
+            ok = (bot > 0) & (raw_Iq >= 0)
+            if not ok.any():
+                ei.setData(x=empty, y=empty, top=empty, bottom=empty)
+                continue
+            if log:
+                # Also require Iq > bot so log10(Iq - bot) is finite.
+                # Points where the lower bound reaches ≤ 0 are simply not drawn.
+                ok_log = ok & (Iq > bot)
+                if not ok_log.any():
+                    ei.setData(x=empty, y=empty, top=empty, bottom=empty)
+                    continue
+                lq_ok  = np.log10(q[ok_log])
+                lIq_ok = np.log10(Iq[ok_log])
+                top    = np.log10(Iq[ok_log] + si[ok_log]) - lIq_ok
+                bottom = lIq_ok - np.log10(Iq[ok_log] - bot[ok_log])
+                ei.setData(x=lq_ok, y=lIq_ok, top=top, bottom=bottom)
+            else:
+                ei.setData(x=q[ok], y=Iq[ok], top=si[ok], bottom=bot[ok])
+
     def _update_log(self, log: bool):
         self._pw_iq.setLogMode(x=True, y=log)
-        self._refresh_errorbars()
+        if self._result is not None:
+            self._update_iq_plot()   # PlotCurveItems need manual re-render on log toggle
+        else:
+            self._refresh_errorbars()
 
 
     def _update_stuhrmann(self):
@@ -741,8 +1103,20 @@ class DecompositionTab(QWidget):
         from numpy.linalg import lstsq
 
         q_j   = self._q[idx]
-        Iq_j  = self._I_matrix[:, idx]
-        sig_j = self._sig[:, idx]
+        Iq_j  = self._I_matrix[:, idx].copy()
+        sig_j = self._sig[:, idx].copy()
+
+        # If a cross-edge β correction was applied to the decomposition, apply
+        # the same scaling here so the marginal intensities are consistent with
+        # the global partials extracted from the β-corrected data.
+        r_beta = self._result
+        if r_beta is not None:
+            beta_v = r_beta.get('beta')
+            eg_v   = r_beta.get('edge_groups')
+            if beta_v is not None and eg_v is not None:
+                scale  = beta_v[eg_v]      # (N_E,)
+                Iq_j   = Iq_j  / scale
+                sig_j  = sig_j / scale
 
         # Determine active elements to plot
         elems = self._elements if self._elements else \
@@ -787,49 +1161,71 @@ class DecompositionTab(QWidget):
             if len(fp) == 0:
                 continue
 
-            # Compute marginal intensity for this element
-            if n_elems == 1 or r is None:
-                # N=1: use raw I(q,E) directly (backward compat)
-                I_marginal = Iq_j
+            # Near-edge mask: keep only energies belonging to this element's edge.
+            # For N>1 use the edge-group assignment so each panel shows only its
+            # own edge energies (the fp-threshold alone also selects off-edge
+            # energies from the other element's scan where f'_i is ~constant).
+            eg_all = r.get('edge_groups_all') if r is not None else None
+            if n_elems > 1 and eg_all is not None:
+                mask = (eg_all == panel_i)
+                if mask.sum() < 3:
+                    mask = np.ones(len(fp), dtype=bool)   # fallback: show all
             else:
-                # Subtract other elements' pure contributions
+                fp_max   = float(np.max(fp))
+                fp_range = float(np.max(fp) - np.min(fp))
+                threshold = max(0.5, 0.05 * fp_range)
+                mask = fp < (fp_max - threshold)
+                if mask.sum() < 3:
+                    mask = np.ones(len(fp), dtype=bool)   # fallback: show all
+
+            fp_m   = fp[mask]
+            fpp_m  = fpp[mask]
+            Iq_m   = Iq_j[mask]
+            sig_m  = sig_j[mask]
+
+            # Compute marginal intensity for this element (on masked subset)
+            if n_elems == 1 or r is None:
+                I_marginal = Iq_m
+            else:
                 names   = r['multi']['names']
                 parts_q = r['multi']['partials'][:, ri]
                 I_MM_g  = parts_q[names.index('I_MM')]
-                I_marginal = Iq_j.copy() - I_MM_g
+                I_marginal = Iq_m.copy() - I_MM_g
                 for j, other in enumerate(elems):
                     if j == panel_i:
                         continue
-                    fp_j  = other['fp']
-                    fpp_j = other['fpp']
+                    fp_j  = other['fp'][mask]
+                    fpp_j = other['fpp'][mask]
                     nm_RjM  = f'I_R{j+1}M'
                     nm_RjRj = f'I_R{j+1}R{j+1}'
                     I_RjM  = parts_q[names.index(nm_RjM)]  if nm_RjM  in names else 0.0
                     I_RjRj = parts_q[names.index(nm_RjRj)] if nm_RjRj in names else 0.0
                     I_marginal -= 2.0 * fp_j * I_RjM + (fp_j**2 + fpp_j**2) * I_RjRj
+                    # cross-term I_RiRj intentionally kept in I_marginal so the
+                    # decomp fit curve (which includes it) matches the data
 
-            # Local WLS solve using just this element's 3-term model
-            A_loc = build_A(fp, fpp)
-            w     = 1.0 / np.maximum(sig_j, 1e-30)
+            # Local WLS solve on near-edge energies only
+            A_loc = build_A(fp_m, fpp_m)
+            w     = 1.0 / np.maximum(sig_m, 1e-30)
             sol, *_ = lstsq(A_loc * w[:, None], I_marginal * w, rcond=None)
             I_MM_j, I_RM_j, I_RR_j = sol
 
-            fp_dense  = np.linspace(fp.min() - 0.5, fp.max() + 0.5, 300)
-            _sort     = np.argsort(fp)
-            fpp_dense = np.interp(fp_dense, fp[_sort], fpp[_sort])
+            fp_dense  = np.linspace(fp_m.min() - 0.5, fp_m.max() + 0.5, 300)
+            _sort     = np.argsort(fp_m)
+            fpp_dense = np.interp(fp_dense, fp_m[_sort], fpp_m[_sort])
             I_fit     = (I_MM_j + 2*fp_dense*I_RM_j
                          + (fp_dense**2 + fpp_dense**2)*I_RR_j)
 
             new_items = []
 
             scatter = pg.ScatterPlotItem(
-                x=fp, y=I_marginal, size=9,
+                x=fp_m, y=I_marginal, size=9,
                 pen=pg.mkPen(col_data), brush=pg.mkBrush(col_data),
                 name='data')
             pw.addItem(scatter)
             new_items.append(scatter)
 
-            ei = pg.ErrorBarItem(x=fp, y=I_marginal, top=sig_j, bottom=sig_j,
+            ei = pg.ErrorBarItem(x=fp_m, y=I_marginal, top=sig_m, bottom=sig_m,
                                  pen=pg.mkPen(col_data, width=1.0))
             pw.addItem(ei)
             new_items.append(ei)
@@ -840,24 +1236,48 @@ class DecompositionTab(QWidget):
             pw.addItem(fit_c)
             new_items.append(fit_c)
 
-            # Weighted residuals
-            I_model_pts = (I_MM_j + 2*fp*I_RM_j
-                           + (fp**2 + fpp**2)*I_RR_j)
-            resid_w = (I_marginal - I_model_pts) / np.maximum(sig_j, 1e-30)
-            pts_resid.setData(x=fp, y=resid_w)
-
-            # Global decomp fit overlay
+            # Extract global decomp fit parameters before residuals (needed for
+            # N>1 where we show global-model residuals, not local-fit residuals).
+            I_MM_g = I_RiM_g = I_RiRi_g = None
             if r is not None and ri is not None:
                 nm_RiM  = f'I_R{panel_i+1}M'
                 nm_RiRi = f'I_R{panel_i+1}R{panel_i+1}'
-                names_g = r['multi']['names'] if r.get('multi') else ['I_MM','I_R1M','I_R1R1']
+                names_g  = r['multi']['names'] if r.get('multi') else ['I_MM', 'I_R1M', 'I_R1R1']
                 parts_ri = r['multi']['partials'][:, ri] if r.get('multi') \
                            else np.array([r['I_MM'][ri], r['I_RM'][ri], r['I_RR'][ri]])
-                I_MM_g  = parts_ri[names_g.index('I_MM')]
-                I_RiM_g = parts_ri[names_g.index(nm_RiM)]  if nm_RiM  in names_g else r['I_RM'][ri]
+                I_MM_g   = parts_ri[names_g.index('I_MM')]
+                I_RiM_g  = parts_ri[names_g.index(nm_RiM)]  if nm_RiM  in names_g else r['I_RM'][ri]
                 I_RiRi_g = parts_ri[names_g.index(nm_RiRi)] if nm_RiRi in names_g else r['I_RR'][ri]
-                I_comp = (I_MM_g + 2*fp_dense*I_RiM_g
-                          + (fp_dense**2 + fpp_dense**2)*I_RiRi_g)
+
+            # For N>1: find WLS-optimal intercept for the global slopes against
+            # the marginal data.  Using I_MM_j (from local 3-param fit) would
+            # mix local and global parameters and cause a systematic offset when
+            # the local and global slopes differ.
+            const_g = None
+            if n_elems > 1 and I_RiM_g is not None:
+                curve_g  = 2*fp_m*I_RiM_g + (fp_m**2 + fpp_m**2)*I_RiRi_g
+                w2       = (1.0 / np.maximum(sig_m, 1e-30))**2
+                const_g  = float(np.sum(w2 * (I_marginal - curve_g)) / np.sum(w2))
+
+            # Weighted residuals.  For N=1 use local-fit model; for N>1 use
+            # the global decomp fit with its optimally anchored intercept.
+            if n_elems > 1 and const_g is not None:
+                I_model_pts = (const_g + 2*fp_m*I_RiM_g
+                               + (fp_m**2 + fpp_m**2)*I_RiRi_g)
+            else:
+                I_model_pts = (I_MM_j + 2*fp_m*I_RM_j
+                               + (fp_m**2 + fpp_m**2)*I_RR_j)
+            resid_w = (I_marginal - I_model_pts) / np.maximum(sig_m, 1e-30)
+            pts_resid.setData(x=fp_m, y=resid_w)
+
+            # Global decomp fit overlay
+            if I_RiM_g is not None:
+                if n_elems == 1:
+                    I_comp = (I_MM_g + 2*fp_dense*I_RiM_g
+                              + (fp_dense**2 + fpp_dense**2)*I_RiRi_g)
+                else:
+                    I_comp = (const_g + 2*fp_dense*I_RiM_g
+                              + (fp_dense**2 + fpp_dense**2)*I_RiRi_g)
                 comp_c = pg.PlotDataItem(
                     fp_dense, I_comp,
                     pen=pg.mkPen('#aed581', width=1.5,
@@ -901,6 +1321,9 @@ class DecompositionTab(QWidget):
             self._fpp = elements[0]['fpp']
         n = max(1, len(elements))
         self._rebuild_stuhr_panels(n)
+        # Refresh β₃ visibility based on actual element count
+        self._beta_lbl_3.setVisible(n >= 3)
+        self._beta_spin_3.setVisible(n >= 3)
         self._update_stuhrmann()
 
     def set_fp_fpp(self, fp: np.ndarray, fpp: np.ndarray):

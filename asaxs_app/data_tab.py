@@ -68,11 +68,20 @@ class DataTab(QWidget):
 
         # Toolbar
         btn_row = QHBoxLayout()
-        self._btn_add    = QPushButton('Add files…')
-        self._btn_remove = QPushButton('Remove selected')
-        self._btn_clear  = QPushButton('Clear all')
+        self._btn_add       = QPushButton('Add files…')
+        self._btn_remove    = QPushButton('Remove selected')
+        self._btn_clear     = QPushButton('Clear all')
+        self._btn_save_list = QPushButton('Save list…')
+        self._btn_save_list.setToolTip(
+            'Save the current file list (paths, energies, element selections)\n'
+            'to a JSON file so the session can be restored in one click.')
+        self._btn_load_list = QPushButton('Load list…')
+        self._btn_load_list.setToolTip(
+            'Load a previously saved file list — reloads all data files\n'
+            'and restores element selections and q-grid settings.')
         self._lbl_status = QLabel()
-        for w in (self._btn_add, self._btn_remove, self._btn_clear, self._lbl_status):
+        for w in (self._btn_add, self._btn_remove, self._btn_clear,
+                  self._btn_save_list, self._btn_load_list, self._lbl_status):
             btn_row.addWidget(w)
         btn_row.addStretch()
         lay.addLayout(btn_row)
@@ -245,6 +254,8 @@ class DataTab(QWidget):
         self._btn_add.clicked.connect(self._add_files)
         self._btn_remove.clicked.connect(self._remove_selected)
         self._btn_clear.clicked.connect(self._clear)
+        self._btn_save_list.clicked.connect(self._save_filelist)
+        self._btn_load_list.clicked.connect(self._load_filelist)
         self._table.itemChanged.connect(self._on_item_changed)
         self._table.currentItemChanged.connect(
             lambda cur, _: self._on_row_changed(cur.row() if cur else -1))
@@ -543,6 +554,7 @@ class DataTab(QWidget):
                 sym = f'Z{self._elem_Z[i]}'
             result.append({
                 'Z':     self._elem_Z[i],
+                'shell': self._elem_shell[i],
                 'label': f'{sym} (elem {i+1})',
                 'fp':    self._elem_fp[i],
                 'fpp':   self._elem_fpp[i],
@@ -632,12 +644,22 @@ class DataTab(QWidget):
                 pw.setLabel('bottom', f"f'  (e) — elem {elem_i+1}")
                 title_suffix = f"f'₁(E)" if n <= 1 else f"f'_{elem_i+1}(E)"
                 pw.setTitle(f"Element {elem_i+1} — I vs {title_suffix}  at q")
+                # Keep only energies with meaningful anomalous contrast for this element.
+                # Energies far from the edge have f'_i near its maximum (background);
+                # filter them out so panels don't show the other element's energy range.
+                fp_max = float(np.max(fp_arr))
+                fp_range = float(np.max(fp_arr) - np.min(fp_arr))
+                threshold = max(0.5, 0.05 * fp_range)
+                near_edge_mask = fp_arr < (fp_max - threshold)
             else:
                 x_vals = np.array([d['energy'] for d in active])
                 pw.setLabel('bottom', 'Energy (keV)')
                 pw.setTitle('I(q, E)  vs  energy  at selected q')
+                near_edge_mask = np.ones(len(x_vals), dtype=bool)
 
             for k, (ds, x) in enumerate(zip(active, x_vals)):
+                if not near_edge_mask[k]:
+                    continue
                 I_at_q   = float(np.interp(q_val, ds['q'], ds['I']))
                 sig_at_q = float(np.interp(q_val, ds['q'], ds['sigma']))
                 if I_at_q <= 0:
@@ -708,6 +730,125 @@ class DataTab(QWidget):
         for i, (ds, c) in enumerate(zip(self._datasets, self._curves)):
             rgb = self._row_color(i, total)
             c.setPen(pg.mkPen(pg.mkColor(*rgb), width=1.5))
+
+    def _save_filelist(self):
+        import json
+        if not self._datasets:
+            QMessageBox.information(self, 'Nothing to save', 'No files are loaded.')
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Save file list', '',
+            'ASAXS file list (*.json);;All files (*)')
+        if not path:
+            return
+        if not path.endswith('.json'):
+            path += '.json'
+        data = {
+            'asaxs_filelist_version': 1,
+            'files': [
+                {
+                    'path': str(ds['path']),
+                    'energy': ds.get('energy'),
+                    'active': bool(ds.get('active', True)),
+                }
+                for ds in self._datasets
+            ],
+            'elements': [
+                {
+                    'Z': self._elem_Z[i],
+                    'shell': self._elem_shell[i],
+                    'enabled': bool(i == 0 or self._elem_chk[i].isChecked()),
+                }
+                for i in range(3)
+            ],
+            'q_min': self._q_min.value(),
+            'q_max': self._q_max.value(),
+            'n_pts': int(self._n_pts.value()),
+        }
+        try:
+            Path(path).write_text(json.dumps(data, indent=2))
+            self._lbl_status.setText(
+                f'Saved: {Path(path).name}  ({len(self._datasets)} files)')
+        except Exception as e:
+            QMessageBox.warning(self, 'Save error', str(e))
+
+    def _load_filelist(self):
+        import json
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Load file list', '',
+            'ASAXS file list (*.json);;All files (*)')
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text())
+        except Exception as e:
+            QMessageBox.warning(self, 'Load error',
+                                f'Cannot read {Path(path).name}:\n{e}')
+            return
+        if data.get('asaxs_filelist_version', 0) < 1:
+            QMessageBox.warning(self, 'Load error', 'Unrecognised file list format.')
+            return
+
+        if self._datasets:
+            reply = QMessageBox.question(
+                self, 'Clear existing data?',
+                'Clear the current file list before loading?',
+                QMessageBox.StandardButton.Yes |
+                QMessageBox.StandardButton.No |
+                QMessageBox.StandardButton.Cancel)
+            if reply == QMessageBox.StandardButton.Cancel:
+                return
+            if reply == QMessageBox.StandardButton.Yes:
+                self._clear()
+
+        # Restore element Z/shell BEFORE _sort_and_emit so _update_element_presets
+        # can match them against the newly available energies.
+        for i, elem_info in enumerate(data.get('elements', [])):
+            if i >= 3:
+                break
+            Z       = int(elem_info.get('Z', 0))
+            shell   = str(elem_info.get('shell', ''))
+            enabled = bool(elem_info.get('enabled', i == 0))
+            self._elem_Z[i]     = Z
+            self._elem_shell[i] = shell
+            if i > 0:
+                self._elem_chk[i].blockSignals(True)
+                self._elem_chk[i].setChecked(enabled and Z > 0)
+                self._elem_combo[i].setEnabled(enabled and Z > 0)
+                self._elem_chk[i].blockSignals(False)
+
+        # Restore q-grid settings (blockSignals to avoid early recomputation)
+        for sp, key in [(self._q_min, 'q_min'), (self._q_max, 'q_max'),
+                        (self._n_pts, 'n_pts')]:
+            if key in data:
+                sp.blockSignals(True)
+                sp.setValue(data[key])
+                sp.blockSignals(False)
+
+        # Load each file
+        errors = []
+        for entry in data.get('files', []):
+            p = entry.get('path', '')
+            try:
+                ds = load_file(p)
+                ds['energy'] = entry.get('energy')
+                ds['active'] = bool(entry.get('active', True))
+                self._datasets.append(ds)
+            except Exception as e:
+                errors.append(f'{Path(p).name}: {e}')
+
+        # Rebuild table, recolor, update element presets
+        self._sort_and_emit()
+
+        if errors:
+            QMessageBox.warning(
+                self, f'{len(errors)} file(s) failed to load',
+                '\n'.join(errors[:15]) +
+                (f'\n… and {len(errors)-15} more' if len(errors) > 15 else ''))
+        else:
+            n = len(data.get('files', []))
+            self._lbl_status.setText(
+                f'Loaded: {Path(path).name}  ({n} files)')
 
     def _sort_and_emit(self):
         # Sort by energy

@@ -214,25 +214,33 @@ def stuhrmann_analysis(
 
 # ── Multi-element decomposition ───────────────────────────────────────────────
 
-def partial_names_multi(n_elem: int) -> list:
+def partial_names_multi(n_elem: int, include_cross: bool = False) -> list:
     """Ordered list of partial structure factor names for N elements.
-    Order: I_MM, I_R1M,..,I_RNM, I_R1R1,..,I_RNRN, I_R1R2,..,I_R(N-1)RN
+    Order: I_MM, I_R1M,..,I_RNM, I_R1R1,..,I_RNRN[, I_R1R2,..,I_R(N-1)RN]
+
+    include_cross: include cross-terms I_RiRj (i≠j).  Default False because
+    for the typical ASAXS experiment where each element's edge is scanned
+    separately, f'_j is approximately constant at element-i's edge energies,
+    making the I_RiRj column proportional to the I_RiM column → near-singular
+    design matrix and unreliable estimates.  Set True only when energies are
+    chosen so that both f'_i and f'_j vary simultaneously.
     """
     names = ['I_MM']
     for i in range(n_elem):
         names.append(f'I_R{i+1}M')
     for i in range(n_elem):
         names.append(f'I_R{i+1}R{i+1}')
-    for i in range(n_elem):
-        for j in range(i+1, n_elem):
-            names.append(f'I_R{i+1}R{j+1}')
+    if include_cross:
+        for i in range(n_elem):
+            for j in range(i+1, n_elem):
+                names.append(f'I_R{i+1}R{j+1}')
     return names
 
 
-def build_A_multi(elements: list) -> np.ndarray:
+def build_A_multi(elements: list, include_cross: bool = False) -> np.ndarray:
     """Build (N_E, n_cols) design matrix for N resonant elements.
     elements: list of (fp, fpp) array pairs.
-    Column order matches partial_names_multi().
+    Column order matches partial_names_multi(include_cross=include_cross).
     """
     N_E = len(elements[0][0])
     cols = [np.ones(N_E)]
@@ -240,16 +248,144 @@ def build_A_multi(elements: list) -> np.ndarray:
         cols.append(2.0 * fp)
     for fp, fpp in elements:
         cols.append(fp**2 + fpp**2)
-    for i in range(len(elements)):
-        for j in range(i+1, len(elements)):
-            fp_i, fpp_i = elements[i]
-            fp_j, fpp_j = elements[j]
-            cols.append(2.0 * (fp_i*fp_j + fpp_i*fpp_j))
+    if include_cross:
+        for i in range(len(elements)):
+            for j in range(i+1, len(elements)):
+                fp_i, fpp_i = elements[i]
+                fp_j, fpp_j = elements[j]
+                cols.append(2.0 * (fp_i*fp_j + fpp_i*fpp_j))
     return np.column_stack(cols)
 
 
-def condition_number_multi(elements: list) -> float:
-    return float(np.linalg.cond(build_A_multi(elements)))
+def condition_number_multi(elements: list, include_cross: bool = False) -> float:
+    return float(np.linalg.cond(build_A_multi(elements, include_cross=include_cross)))
+
+
+def decompose_multi_per_edge(
+    q: np.ndarray,
+    I_matrix: np.ndarray,
+    sigma_matrix: np.ndarray,
+    elements: list,
+    edge_groups: np.ndarray,
+    beta: np.ndarray | None = None,
+    include_cross: bool = True,
+) -> dict:
+    """Global WLS with per-edge offset columns for N-element ASAXS.
+
+    Builds an extended design matrix:
+
+        A_ext = [1_{g0}, 1_{g1}, ...,               ← per-edge indicator offsets
+                 2f'_1, 2f'_2, ...,                  ← I_RiM physical columns
+                 f'_1²+f''_1², f'_2²+f''_2², ...,   ← I_RiRi physical columns
+                 2(f'_1·f'_2+f''_1·f''_2), ...]      ← I_RiRj cross-terms (if include_cross)
+
+    The indicator columns absorb cross-edge absolute-scale mismatch without
+    restricting the physical parameters to a single edge's data.  All physical
+    parameters are fitted jointly across every edge.
+
+    include_cross=True (default): include cross-terms I_RiRj (i<j).  These are
+    NOT collinear in this matrix because the cross-term column varies with f'_i
+    at edge-i energies and with f'_j at edge-j energies — distinct patterns that
+    the per-edge indicator columns cannot replicate.  Omitting cross-terms when
+    they are physically present biases I_RiRi and I_RjRj (the unmodelled signal
+    is absorbed into the diagonal partials).
+
+    I_MM is estimated as the average of the per-edge intercepts after
+    subtracting each edge's mean contribution from the other elements.
+    """
+    N_elem = len(elements)
+    NQ     = len(q)
+    NE     = I_matrix.shape[0]
+    names  = partial_names_multi(N_elem, include_cross=include_cross)
+    n_cols = len(names)
+    parts  = np.zeros((n_cols, NQ))
+    errs   = np.zeros((n_cols, NQ))
+
+    if beta is not None and len(beta) > 1:
+        scale   = beta[edge_groups]
+        I_use   = I_matrix    / scale[:, None]
+        sig_use = sigma_matrix / scale[:, None]
+    else:
+        I_use   = I_matrix
+        sig_use = sigma_matrix
+
+    RM_idx  = {i: names.index(f'I_R{i+1}M')      for i in range(N_elem)}
+    RR_idx  = {i: names.index(f'I_R{i+1}R{i+1}') for i in range(N_elem)}
+    MM_idx  = names.index('I_MM')
+    # Cross-term indices (only if include_cross)
+    cross_pairs = [(i, j) for i in range(N_elem) for j in range(i+1, N_elem)] \
+                  if include_cross else []
+    RC_idx  = {(i, j): names.index(f'I_R{i+1}R{j+1}') for i, j in cross_pairs}
+
+    unique_groups = np.unique(edge_groups)
+    N_groups      = len(unique_groups)
+
+    if N_groups <= 1:
+        # Single group: fall back to standard 3-param fit (no cross-term for 1 element)
+        fp0, fpp0 = elements[0]
+        A = build_A(fp0, fpp0)
+        for j in range(NQ):
+            sig = np.maximum(sig_use[:, j], 1e-30)
+            sol, e = _wls_with_errors(A, I_use[:, j], 1.0 / sig)
+            parts[MM_idx,    j] = sol[0]; errs[MM_idx,    j] = e[0]
+            parts[RM_idx[0], j] = sol[1]; errs[RM_idx[0], j] = e[1]
+            parts[RR_idx[0], j] = sol[2]; errs[RR_idx[0], j] = e[2]
+        C_local = parts[[MM_idx], :]
+        return {'names': names, 'partials': parts, 'errors': errs, 'C_local': C_local}
+
+    # Extended design matrix:
+    #   cols 0 .. N_groups-1              : indicator 1_{g_k}
+    #   cols N_groups .. N_groups+N-1     : 2·f'_i
+    #   cols N_groups+N .. N_groups+2N-1  : f'_i²+f''_i²
+    #   cols N_groups+2N ..               : cross-terms 2(f'_i·f'_j+f''_i·f''_j)
+    n_ext = N_groups + 2 * N_elem + len(cross_pairs)
+    A_ext = np.zeros((NE, n_ext))
+    for k, g in enumerate(unique_groups):
+        A_ext[edge_groups == g, k] = 1.0
+    for i, (fp_i, fpp_i) in enumerate(elements):
+        A_ext[:, N_groups + i]          = 2.0 * fp_i
+        A_ext[:, N_groups + N_elem + i] = fp_i**2 + fpp_i**2
+    for c, (i, j) in enumerate(cross_pairs):
+        fp_i, fpp_i = elements[i]
+        fp_j, fpp_j = elements[j]
+        A_ext[:, N_groups + 2*N_elem + c] = 2.0 * (fp_i*fp_j + fpp_i*fpp_j)
+
+    C_local    = np.full((N_elem, NQ), np.nan)
+    # Physical part of WLS solution for each q (used to recover I_MM)
+    phys_sols  = np.zeros((n_ext - N_groups, NQ))
+
+    for qi in range(NQ):
+        sig = np.maximum(sig_use[:, qi], 1e-30)
+        sol, e = _wls_with_errors(A_ext, I_use[:, qi], 1.0 / sig)
+        phys_sols[:, qi] = sol[N_groups:]
+        for k, g in enumerate(unique_groups):
+            gi = int(g)
+            if 0 <= gi < N_elem:
+                C_local[gi, qi] = sol[k]
+        for i in range(N_elem):
+            parts[RM_idx[i], qi]  = sol[N_groups + i]
+            errs[RM_idx[i],  qi]  = e[N_groups + i]
+            parts[RR_idx[i], qi]  = sol[N_groups + N_elem + i]
+            errs[RR_idx[i],  qi]  = e[N_groups + N_elem + i]
+        for c, (i, j) in enumerate(cross_pairs):
+            parts[RC_idx[(i, j)], qi] = sol[N_groups + 2*N_elem + c]
+            errs[RC_idx[(i, j)],  qi] = e[N_groups + 2*N_elem + c]
+
+    # I_MM: weighted mean of (data − physical column contributions) over ALL energies.
+    # Using the per-edge indicator mean would absorb cross-term means into C_local[i],
+    # requiring corrections that introduce approximation error (~0.6% bias at low q).
+    # The direct weighted-mean approach is equivalent to M4 (single constant) for I_MM
+    # while keeping per-edge offsets for the physical parameters.
+    A_phys = A_ext[:, N_groups:]  # physical columns only
+    for qi in range(NQ):
+        sig     = np.maximum(sig_use[:, qi], 1e-30)
+        w2      = (1.0 / sig) ** 2
+        residual = I_use[:, qi] - A_phys @ phys_sols[:, qi]
+        total_w2 = float(np.sum(w2))
+        parts[MM_idx, qi] = float(np.sum(w2 * residual) / total_w2)
+        errs[MM_idx, qi]  = float(1.0 / np.sqrt(total_w2))
+
+    return {'names': names, 'partials': parts, 'errors': errs, 'C_local': C_local}
 
 
 def decompose_multi(
@@ -257,23 +393,147 @@ def decompose_multi(
     I_matrix: np.ndarray,
     sigma_matrix: np.ndarray,
     elements: list,
+    beta: np.ndarray | None = None,
+    edge_groups: np.ndarray | None = None,
+    include_cross: bool = False,
 ) -> dict:
     """Multi-element direct decomposition.
     elements: list of (fp, fpp) pairs.
+    beta: optional (N_elem,) normalization vector — element 0 is reference (1.0),
+          each element-i dataset is divided by beta[i] before solving.
+    edge_groups: optional (N_E,) int array assigning each energy to an element index.
+    include_cross: include cross-terms I_RiRj in the model (see partial_names_multi).
     Returns dict with keys:
       'names'    : list of partial names (length n_cols)
       'partials' : ndarray (n_cols, NQ) — best-fit values
       'errors'   : ndarray (n_cols, NQ) — 1σ propagated errors
     """
-    A     = build_A_multi(elements)
-    names = partial_names_multi(len(elements))
+    A     = build_A_multi(elements, include_cross=include_cross)
+    names = partial_names_multi(len(elements), include_cross=include_cross)
     NQ    = len(q)
     n_cols = A.shape[1]
     parts = np.zeros((n_cols, NQ))
     errs  = np.zeros((n_cols, NQ))
+
+    I_use   = I_matrix
+    sig_use = sigma_matrix
+    if beta is not None and edge_groups is not None and len(beta) > 1:
+        scale   = beta[edge_groups]           # (N_E,)
+        I_use   = I_matrix    / scale[:, None]
+        sig_use = sigma_matrix / scale[:, None]
+
     for j in range(NQ):
-        sig = np.maximum(sigma_matrix[:, j], 1e-30)
-        sol, e = _wls_with_errors(A, I_matrix[:, j], 1.0 / sig)
+        sig = np.maximum(sig_use[:, j], 1e-30)
+        sol, e = _wls_with_errors(A, I_use[:, j], 1.0 / sig)
         parts[:, j] = sol
         errs[:, j]  = e
     return {'names': names, 'partials': parts, 'errors': errs}
+
+
+# ── Cross-edge normalization ───────────────────────────────────────────────────
+
+def compute_edge_groups(elements: list) -> np.ndarray:
+    """Assign each energy to the element with the highest f'' at that energy.
+
+    At an absorption edge f'' peaks sharply, so the element with the largest
+    f'' at energy E_i is the one whose edge dataset that measurement belongs to.
+
+    elements: list of (fp, fpp) array pairs (same format as build_A_multi).
+    Returns int array of shape (N_E,) with values in {0, ..., N_elem-1}.
+
+    NOTE: this can fail when tabulated (Cromer-Mann) f'' values are used,
+    because the white-line enhancement is absent and one element's f'' may
+    dominate all energies.  Prefer compute_edge_groups_by_energy() when
+    element Z/shell and measurement energies are available.
+    """
+    if len(elements) <= 1:
+        return np.zeros(len(elements[0][1]), dtype=int)
+    fpp_stack = np.column_stack([fpp for _, fpp in elements])  # (N_E, N_elem)
+    return np.argmax(fpp_stack, axis=1).astype(int)
+
+
+def compute_edge_groups_by_energy(
+    elem_meta: list,
+    energies_keV: np.ndarray,
+) -> np.ndarray:
+    """Assign each measurement energy to the nearest element edge.
+
+    This is more reliable than compute_edge_groups() when using tabulated
+    (Cromer-Mann) f'' values that lack the true white-line enhancement.
+
+    elem_meta : list of dicts with keys 'Z' (int) and 'shell' (str, e.g. 'K', 'L3').
+    energies_keV : (N_E,) array of measurement energies in keV.
+    Returns int array of shape (N_E,) with values in {0, ..., N_elem-1}.
+    """
+    try:
+        import xraydb
+    except ImportError:
+        # Fall back to equal assignment
+        N_E = len(energies_keV)
+        return np.zeros(N_E, dtype=int)
+
+    edge_eV = []
+    for m in elem_meta:
+        Z = m.get('Z', 0)
+        shell = m.get('shell', '')
+        try:
+            e = float(xraydb.xray_edge(Z, shell).energy)   # eV
+        except Exception:
+            e = float('inf')
+        edge_eV.append(e)
+
+    energies_eV = np.asarray(energies_keV) * 1000.0
+    # distance of each energy to each element's edge (absolute difference in eV)
+    dists = np.column_stack([np.abs(energies_eV - e) for e in edge_eV])
+    return np.argmin(dists, axis=1).astype(int)
+
+
+def estimate_normalization_lowq(
+    q: np.ndarray,
+    I_matrix: np.ndarray,
+    edge_groups: np.ndarray,
+    q_frac: float = 0.05,
+) -> np.ndarray:
+    """Estimate relative edge-group normalizations from the low-q intensity ratio.
+
+    At low q, I(q,E) ≈ I_MM(q) for all energies because the anomalous
+    contributions 2f'·I_RM and (f'²+f''²)·I_RR are small compared to I_MM.
+    The ratio of median intensities across edge groups therefore estimates the
+    relative normalization: β_i = <I(q_low, E∈group_i)> / <I(q_low, E∈group_0)>.
+
+    Assumptions:
+      - Data are in absolute units with absorption/transmission corrections applied.
+      - Anomalous contrast is small (I_RM ≲ 5% of I_MM at low q).
+        For large anomalous contrast, the estimate will be biased.
+      - The lowest `q_frac` fraction of the q-range is in the Guinier/near-Guinier
+        regime where I(q) is nearly energy-independent.
+
+    q_frac : fraction of q range to use (default 5%, i.e. bottom 5% of q values).
+    Returns beta array of shape (N_elem,) with beta[0] = 1.0 (group 0 is reference).
+    beta[i] > 1 means group i has higher absolute intensity than the reference.
+    Divide group i's data by beta[i] to bring it to the reference scale.
+    """
+    N_elem = int(edge_groups.max()) + 1 if len(edge_groups) > 0 else 1
+    if N_elem <= 1:
+        return np.ones(1)
+
+    # Check that every group has at least one energy point
+    present = set(int(g) for g in edge_groups)
+    if len(present) < N_elem:
+        missing = [i for i in range(N_elem) if i not in present]
+        raise ValueError(
+            f'Edge groups {missing} have no energy points assigned')
+
+    n_lq = max(3, int(len(q) * q_frac))
+    sort_idx = np.argsort(q)
+    I_lq = I_matrix[:, sort_idx[:n_lq]]   # (N_E, n_lq)
+
+    group_medians = np.ones(N_elem)
+    for g in range(N_elem):
+        mask = edge_groups == g
+        if mask.any():
+            val = float(np.median(I_lq[mask, :]))
+            group_medians[g] = val if np.isfinite(val) and val > 0 else 1.0
+
+    beta = group_medians / group_medians[0]
+    return np.where(np.isfinite(beta) & (beta > 0), beta, 1.0)

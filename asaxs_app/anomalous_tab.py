@@ -43,9 +43,9 @@ def _edge_energy_keV(Z: int, shell: str) -> float:
 
 # Per-element color scheme: (dense_curve_color, scatter_color)
 _ELEM_COLORS = [
-    ('b',       'darkblue'),    # Element 1: blue
-    ('orange',  'darkorange'),  # Element 2: orange
-    ('g',       'darkgreen'),   # Element 3: green
+    ('#42A5F5', '#42A5F5'),   # Element 1: bright blue
+    ('#FFA726', '#FFA726'),   # Element 2: orange
+    ('#66BB6A', '#66BB6A'),   # Element 3: green
 ]
 
 
@@ -57,6 +57,8 @@ class AnomalousTab(QWidget):
         self._elem_pts_fp:     list = []
         self._elem_curves_fpp: list = []
         self._elem_pts_fpp:    list = []
+        self._edge_vlines_fp:  list = []
+        self._edge_vlines_fpp: list = []
         self._build_ui()
 
     def _build_ui(self):
@@ -67,18 +69,12 @@ class AnomalousTab(QWidget):
         self._pw_fp.setLabel('bottom', 'E (keV)')
         self._pw_fp.setLabel('left', "f' (e)")
         self._pw_fp.addLegend(offset=(10, 10))
-        self._vline_fp = pg.InfiniteLine(
-            angle=90, pen=pg.mkPen('r', style=pg.QtCore.Qt.PenStyle.DashLine))
-        self._pw_fp.addItem(self._vline_fp)
         plots.addWidget(self._pw_fp)
 
         self._pw_fpp = pg.PlotWidget(title="f''(E)  (e)")
         self._pw_fpp.setLabel('bottom', 'E (keV)')
         self._pw_fpp.setLabel('left', "f'' (e)")
         self._pw_fpp.addLegend(offset=(10, 10))
-        self._vline_fpp = pg.InfiniteLine(
-            angle=90, pen=pg.mkPen('r', style=pg.QtCore.Qt.PenStyle.DashLine))
-        self._pw_fpp.addItem(self._vline_fpp)
         plots.addWidget(self._pw_fpp)
 
         lay.addLayout(plots)
@@ -101,10 +97,16 @@ class AnomalousTab(QWidget):
             self._pw_fpp.removeItem(c)
         for p in self._elem_pts_fpp:
             self._pw_fpp.removeItem(p)
+        for v in self._edge_vlines_fp:
+            self._pw_fp.removeItem(v)
+        for v in self._edge_vlines_fpp:
+            self._pw_fpp.removeItem(v)
         self._elem_curves_fp.clear()
         self._elem_pts_fp.clear()
         self._elem_curves_fpp.clear()
         self._elem_pts_fpp.clear()
+        self._edge_vlines_fp.clear()
+        self._edge_vlines_fpp.clear()
 
     # ── Public API ────────────────────────────────────────────────────────────
     def display(self, energies: np.ndarray, elements):
@@ -135,10 +137,19 @@ class AnomalousTab(QWidget):
         except Exception:
             pass
 
-        e_dense = np.linspace(float(energies.min()) - 0.2,
-                              float(energies.max()) + 0.2, 300)
+        # Adaptive dense grid: coarse over full range + fine grid near each element's edge
+        e_coarse = np.linspace(float(energies.min()) - 0.2,
+                               float(energies.max()) + 0.2, 400)
+        e_fine_parts = [e_coarse]
+        for elem in elements:
+            Z_e = elem.get('Z', 0)
+            if Z_e > 0:
+                shell = 'L3' if Z_e > 50 else 'K'
+                e_edge = _edge_energy_keV(Z_e, shell)
+                if e_edge:
+                    e_fine_parts.append(np.linspace(e_edge - 0.15, e_edge + 0.15, 400))
+        e_dense = np.unique(np.concatenate(e_fine_parts))
 
-        first_edge_set = False
         for i, elem in enumerate(elements):
             Z   = elem.get('Z', 0)
             fp  = elem['fp']
@@ -180,11 +191,25 @@ class AnomalousTab(QWidget):
             self._elem_pts_fp.append(p_fp)
             self._elem_pts_fpp.append(p_fpp)
 
-            # Edge vline — use first element's edge
-            if not first_edge_set and Z > 0:
+            # Per-element edge vline in the element's color
+            if Z > 0:
                 shell = 'L3' if Z > 50 else 'K'
                 e_edge = _edge_energy_keV(Z, shell)
                 if e_edge:
-                    self._vline_fp.setValue(e_edge)
-                    self._vline_fpp.setValue(e_edge)
-                first_edge_set = True
+                    vl_fp = pg.InfiniteLine(
+                        angle=90,
+                        pen=pg.mkPen(dense_col, width=1.2,
+                                     style=pg.QtCore.Qt.PenStyle.DashLine))
+                    vl_fpp = pg.InfiniteLine(
+                        angle=90,
+                        pen=pg.mkPen(dense_col, width=1.2,
+                                     style=pg.QtCore.Qt.PenStyle.DashLine))
+                    vl_fp.setValue(e_edge)
+                    vl_fpp.setValue(e_edge)
+                    self._pw_fp.addItem(vl_fp)
+                    self._pw_fpp.addItem(vl_fpp)
+                    self._edge_vlines_fp.append(vl_fp)
+                    self._edge_vlines_fpp.append(vl_fpp)
+
+        self._pw_fp.enableAutoRange()
+        self._pw_fpp.enableAutoRange()

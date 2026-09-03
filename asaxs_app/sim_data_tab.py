@@ -249,6 +249,179 @@ def _compute_partials(q, cfg, log):
     sc = phi / Vp * 1e24 * (2.818e-13)**2
     return sc * I_MM_r, sc * I_RM_r, sc * I_RR_r
 
+
+def _compute_partials_multi(q, cfg, elem_results, log):
+    """Compute all ASAXS partials for N elements with per-element geometry.
+
+    Each elem in elem_results must have 'location': 'core' or 'shell'.
+    Returns (I_MM, [I_R1M,...], [I_R1R1,...], {(i,j): I_RiRj,...})  all in cm⁻¹.
+    """
+    core = cfg['core']; shell = cfg['shell']; solv = cfg['solvent']
+    rho_c = _elec_density(core['mass_density'], core['molar_mass'], core['n_electrons'])
+    rho_s = _elec_density(shell['mass_density'], shell['molar_mass'], shell['n_electrons'])
+    rho_v = _elec_density(solv['mass_density'], solv['molar_mass'], solv['n_electrons'])
+    dr_c = rho_c - rho_v;  dr_s = rho_s - rho_v
+    sig_c = core.get('sigma_rel', 0.0);  sig_s = shell.get('sigma_rel', 0.0)
+    Rc0 = core['radius_mean'];  Rt0 = shell['radius_outer'];  delta = Rt0 - Rc0
+    phi = cfg['experiment']['volume_fraction']
+    n_elem = len(elem_results)
+    log(f'  ρ_core={rho_c:.4f}  ρ_shell={rho_s:.4f}  ρ_solv={rho_v:.4f} e/Å³')
+
+    # Volume per atom for each element: core element uses core material,
+    # shell element uses shell material (sets the resonant atom number density)
+    V_at = []
+    for elem in elem_results:
+        if elem.get('location', 'core') == 'core':
+            V_at.append(_atom_volume(core['mass_density'], core['molar_mass']))
+        else:
+            V_at.append(_atom_volume(shell['mass_density'], shell['molar_mass']))
+
+    if sig_c == 0.0 and sig_s == 0.0:
+        # ── Monodisperse ──────────────────────────────────────────────────────
+        Vc = _sphere_V(Rc0);  Vt = _sphere_V(Rt0)
+        f0c = _sphere_f0_1d(q, Rc0);  f0t = _sphere_f0_1d(q, Rt0)
+        Fn = (dr_c - dr_s) * Vc * f0c + dr_s * Vt * f0t
+        Fr = []
+        for i, elem in enumerate(elem_results):
+            if elem.get('location', 'core') == 'core':
+                Fr.append(Vc / V_at[i] * f0c)
+            else:
+                Fr.append((Vt * f0t - Vc * f0c) / V_at[i])
+        I_MM   = Fn**2
+        I_RiM  = [Fn * Fr[i] for i in range(n_elem)]
+        I_RiRi = [Fr[i]**2 for i in range(n_elem)]
+        I_RiRj = {(i, j): Fr[i] * Fr[j]
+                  for i in range(n_elem) for j in range(i + 1, n_elem)}
+        Vp = Vt
+        log('  Mode: monodisperse')
+
+    elif sig_c > 0.0 and sig_s == 0.0:
+        # ── Polydisperse core, fixed shell thickness ───────────────────────────
+        Rv, PR = _lognormal_grid(Rc0, sig_c, n=600)
+        Rtv = Rv + delta
+        Vc = _sphere_V(Rv);  Vt = _sphere_V(Rtv)
+        f0c = _sphere_f0_2d(q, Rv);  f0t = _sphere_f0_2d(q, Rtv)
+        Fn = (dr_c - dr_s) * Vc[None, :] * f0c + dr_s * Vt[None, :] * f0t  # (NQ, Nv)
+        Fr = []
+        for i, elem in enumerate(elem_results):
+            if elem.get('location', 'core') == 'core':
+                Fr.append(Vc[None, :] / V_at[i] * f0c)                        # (NQ, Nv)
+            else:
+                Fr.append((Vt[None, :] * f0t - Vc[None, :] * f0c) / V_at[i]) # (NQ, Nv)
+        I_MM   = np.trapz(PR[None, :] * Fn**2,                  Rv, axis=1)
+        I_RiM  = [np.trapz(PR[None, :] * Fn * Fr[i],            Rv, axis=1) for i in range(n_elem)]
+        I_RiRi = [np.trapz(PR[None, :] * Fr[i]**2,              Rv, axis=1) for i in range(n_elem)]
+        I_RiRj = {(i, j): np.trapz(PR[None, :] * Fr[i] * Fr[j], Rv, axis=1)
+                  for i in range(n_elem) for j in range(i + 1, n_elem)}
+        Vp = np.mean(_sphere_V(Rv + delta))
+        log(f'  Mode: core lognormal σ_rel={sig_c:.2f}')
+
+    elif sig_c == 0.0 and sig_s > 0.0:
+        # ── Monodisperse core, polydisperse R_outer ───────────────────────────
+        Vc = _sphere_V(Rc0);  f0c = _sphere_f0_1d(q, Rc0)
+        Fn_core = (dr_c - dr_s) * Vc * f0c                    # (NQ,)
+        Rtv, Ptv = _lognormal_grid(Rt0, sig_s, n=300)
+        mask = Rtv > Rc0 + 1.0
+        Rtv, Ptv = Rtv[mask], Ptv[mask]
+        Ptv /= np.trapz(Ptv, Rtv)
+        Vtv = _sphere_V(Rtv);  f0t = _sphere_f0_2d(q, Rtv)   # (NQ, Nt)
+        shell_amp = dr_s * Vtv[None, :] * f0t                  # (NQ, Nt)
+        mean_sh  = np.trapz(Ptv[None, :] * shell_amp,    Rtv, axis=1)  # (NQ,)
+        mean_sh2 = np.trapz(Ptv[None, :] * shell_amp**2, Rtv, axis=1)  # (NQ,)
+        I_MM = Fn_core**2 + 2 * Fn_core * mean_sh + mean_sh2
+
+        # Per-element resonant amplitudes: 'core' → 1D, 'shell' → 2D (NQ, Nt)
+        Fr = []   # list of (kind, array)
+        for i, elem in enumerate(elem_results):
+            if elem.get('location', 'core') == 'core':
+                Fr.append(('core', Vc / V_at[i] * f0c))                             # (NQ,)
+            else:
+                Fr.append(('shell', (Vtv[None, :] * f0t - Vc * f0c[:, None]) / V_at[i]))  # (NQ, Nt)
+
+        def _avg1(fi_pair):
+            k, a = fi_pair
+            return a if k == 'core' else np.trapz(Ptv[None, :] * a, Rtv, axis=1)
+
+        def _avg_prod(fi_pair, fj_pair):
+            ki, ai = fi_pair;  kj, aj = fj_pair
+            if ki == 'core' and kj == 'core':
+                return ai * aj
+            if ki == 'core':   # aj is 2D
+                return ai * _avg1(fj_pair)
+            if kj == 'core':   # ai is 2D
+                return _avg1(fi_pair) * aj
+            return np.trapz(Ptv[None, :] * ai * aj, Rtv, axis=1)
+
+        I_RiM = []
+        for i in range(n_elem):
+            ki, fi = Fr[i]
+            if ki == 'core':
+                I_RiM.append(fi * (Fn_core + mean_sh))
+            else:
+                mean_fi       = np.trapz(Ptv[None, :] * fi,             Rtv, axis=1)
+                mean_sh_fi    = np.trapz(Ptv[None, :] * shell_amp * fi, Rtv, axis=1)
+                I_RiM.append(Fn_core * mean_fi + mean_sh_fi)
+
+        I_RiRi = []
+        for i in range(n_elem):
+            ki, fi = Fr[i]
+            if ki == 'core':
+                I_RiRi.append(fi**2)
+            else:
+                I_RiRi.append(np.trapz(Ptv[None, :] * fi**2, Rtv, axis=1))
+
+        I_RiRj = {(i, j): _avg_prod(Fr[i], Fr[j])
+                  for i in range(n_elem) for j in range(i + 1, n_elem)}
+        Vp = np.trapz(Ptv * _sphere_V(Rtv), Rtv)
+        log(f'  Mode: R_outer lognormal σ_rel={sig_s:.2f}')
+
+    else:
+        # ── Both polydisperse — 2-D integral ──────────────────────────────────
+        Rv, PRv = _lognormal_grid(Rc0, sig_c, n=60)
+        Rtv, Ptv = _lognormal_grid(Rt0, sig_s, n=60)
+        valid = Rtv > Rv.min() + 1.0
+        Rtv, Ptv = Rtv[valid], Ptv[valid]
+        Ptv /= np.trapz(Ptv, Rtv)
+        Vc = _sphere_V(Rv);  Vt = _sphere_V(Rtv)
+        f0c = _sphere_f0_2d(q, Rv);  f0t = _sphere_f0_2d(q, Rtv)
+        core_amp  = (dr_c - dr_s) * Vc[None, :] * f0c    # (NQ, Nv)
+        shell_amp = dr_s * Vt[None, :] * f0t              # (NQ, Nt)
+        Fn = core_amp[:, :, None] + shell_amp[:, None, :] # (NQ, Nv, Nt)
+        W  = PRv[None, :, None] * Ptv[None, None, :]      # (1, Nv, Nt)
+
+        def _intW(arr3d):
+            return np.trapz(np.trapz(W * arr3d, Rtv, axis=2), Rv, axis=1)
+
+        I_MM = _intW(Fn**2)
+
+        # Per-element resonant amplitudes as (NQ, Nv, Nt) via broadcasting
+        Fr3d = []
+        for i, elem in enumerate(elem_results):
+            if elem.get('location', 'core') == 'core':
+                # (NQ, Nv) → broadcast to (NQ, Nv, Nt)
+                fr = Vc[None, :] / V_at[i] * f0c          # (NQ, Nv)
+                Fr3d.append(fr[:, :, None])                # broadcast over Nt
+            else:
+                # (Vt[Rt]*f0t[q,Rt] - Vc[Rv]*f0c[q,Rv]) — true (NQ, Nv, Nt)
+                Fr3d.append(
+                    (Vt[None, None, :] * f0t[:, None, :] - Vc[None, :, None] * f0c[:, :, None]) / V_at[i]
+                )
+
+        I_MM   = _intW(Fn**2)
+        I_RiM  = [_intW(Fn * Fr3d[i]) for i in range(n_elem)]
+        I_RiRi = [_intW(Fr3d[i]**2)   for i in range(n_elem)]
+        I_RiRj = {(i, j): _intW(Fr3d[i] * Fr3d[j])
+                  for i in range(n_elem) for j in range(i + 1, n_elem)}
+        Vp = np.trapz(Ptv * _sphere_V(Rtv), Rtv)
+        log(f'  Mode: core σ_rel={sig_c:.2f}  R_outer σ_rel={sig_s:.2f}  (2-D grid)')
+
+    sc = phi / Vp * 1e24 * (2.818e-13)**2
+    return (sc * I_MM,
+            [sc * x for x in I_RiM],
+            [sc * x for x in I_RiRi],
+            {k: sc * x for k, x in I_RiRj.items()})
+
+
 def _select_energies(cfg, log=None):
     """Single-element wrapper kept for backward compat."""
     exp = cfg['experiment']
@@ -272,21 +445,37 @@ def _select_energies(cfg, log=None):
 def _select_energies_multi(cfg, log=None):
     """Select energies and compute f'/f'' for all active resonant elements.
 
-    Returns (energies_list, elem_results) where elem_results is a list of
-    {'Z', 'fp', 'fpp', 'scale'} dicts — one per active element.
-    Energies are spaced equidistant in f'(E) for element 1 (primary).
-    """
-    exp      = cfg['experiment']
-    E0, E1, N = exp['E_min_keV'], exp['E_max_keV'], exp['n_energies']
-    elements  = cfg.get('resonant_elements', [{'Z': exp['resonant_Z'], 'scale': 1.0}])
+    Each element has its own E_min/E_max/N range (equidistant in Δf').
+    The per-element grids are combined into a sorted union, and f'/f'' for
+    every element is evaluated on the full combined grid.
 
-    # Select energies equidistant in Δf' for the primary element
-    Z0  = elements[0]['Z']
-    Ed  = np.linspace(E0, E1, 3000)
-    fpd = np.array([xraydb.f1_chantler(Z0, e*1000) for e in Ed])
-    idx = np.argsort(fpd)
-    tgt = np.linspace(fpd[idx[0]], fpd[idx[-1]], N)
-    Es  = sorted(np.interp(tgt, fpd[idx], Ed[idx]))
+    Returns (energies_array, elem_results) where elem_results is a list of
+    {'Z', 'fp', 'fpp', 'scale'} dicts.
+    """
+    elements = cfg.get('resonant_elements', [])
+    if not elements:
+        exp = cfg['experiment']
+        elements = [{'Z': exp.get('resonant_Z', 79), 'scale': 1.0,
+                     'E_min_keV': exp['E_min_keV'], 'E_max_keV': exp['E_max_keV'],
+                     'n_energies': exp['n_energies']}]
+
+    # Build per-element equidistant-Δf' grids and combine
+    all_Es = []
+    for elem in elements:
+        Z = elem['Z']
+        E0 = elem.get('E_min_keV', 10.0)
+        E1 = elem.get('E_max_keV', 11.0)
+        N  = int(elem.get('n_energies', 20))
+        Ed  = np.linspace(E0, E1, 3000)
+        fpd = np.array([xraydb.f1_chantler(Z, e*1000) for e in Ed])
+        idx = np.argsort(fpd)
+        tgt = np.linspace(fpd[idx[0]], fpd[idx[-1]], N)
+        Es_i = sorted(np.interp(tgt, fpd[idx], Ed[idx]))
+        all_Es.extend(Es_i)
+
+    # Sorted union with duplicates removed (within 1 eV)
+    all_Es = sorted(set(round(e, 6) for e in all_Es))
+    Es = np.array(all_Es)
 
     if log:
         hdrs = ['E (keV)'] + [f"f'_{i+1}" for i in range(len(elements))] + \
@@ -301,7 +490,7 @@ def _select_energies_multi(cfg, log=None):
         Z   = elem['Z']
         fp  = np.array([xraydb.f1_chantler(Z, e*1000) for e in Es])
         fpp = np.array([abs(xraydb.f2_chantler(Z, e*1000)) for e in Es])
-        elem_results.append({'Z': Z, 'fp': fp, 'fpp': fpp, 'scale': elem.get('scale', 1.0)})
+        elem_results.append({'Z': Z, 'fp': fp, 'fpp': fpp, 'location': elem.get('location', 'core')})
         fp_table.append(fp); fpp_table.append(fpp)
 
     if log:
@@ -342,26 +531,18 @@ class _GeneratorThread(QThread):
             q       = (np.geomspace if qg.get('spacing','log') == 'log' else np.linspace)(
                 qg['q_min'], qg['q_max'], qg['n_points'])
 
-            self.log_line.emit('Computing partial structure factors (base model) …')
-            I_MM_base, I_RM_base, I_RR_base = _compute_partials(q, cfg, self.log_line.emit)
-            self.log_line.emit(
-                f'  I_MM={I_MM_base[0]:.3e}  I_RM={I_RM_base[0]:.3e}  I_RR={I_RR_base[0]:.3e} cm⁻¹ (at q_min)')
-
-            self.log_line.emit('\nSelecting energies (equidistant Δf′ for elem 1) …')
+            self.log_line.emit('\nSelecting energies (per-element equidistant Δf′ grids) …')
             energies, elem_results = _select_energies_multi(cfg, self.log_line.emit)
             n_elem = len(elem_results)
 
-            # Build per-element scaled partials
-            # I_RiM  = scale_i × I_RM_base
-            # I_RiRi = scale_i² × I_RR_base
-            # I_RiRj = scale_i × scale_j × I_RR_base  (cross-terms, co-location assumed)
-            scales = [e['scale'] for e in elem_results]
-            I_RiM  = [scales[i] * I_RM_base  for i in range(n_elem)]
-            I_RiRi = [scales[i]**2 * I_RR_base for i in range(n_elem)]
-            I_RiRj = {}
-            for i in range(n_elem):
-                for j in range(i+1, n_elem):
-                    I_RiRj[(i,j)] = scales[i] * scales[j] * I_RR_base
+            self.log_line.emit('\nComputing partial structure factors (per-element geometry) …')
+            I_MM, I_RiM, I_RiRi, I_RiRj = _compute_partials_multi(
+                q, cfg, elem_results, self.log_line.emit)
+            self.log_line.emit(
+                f'  I_MM={I_MM[0]:.3e}' +
+                ''.join(f'  I_R{i+1}M={I_RiM[i][0]:.3e}' for i in range(n_elem)) +
+                ''.join(f'  I_R{i+1}R{i+1}={I_RiRi[i][0]:.3e}' for i in range(n_elem)) +
+                '  cm⁻¹ (at q_min)')
 
             nc = cfg['noise']
             if nc['model'] == 'poisson':
@@ -377,7 +558,7 @@ class _GeneratorThread(QThread):
 
             I_obs_list = []
             for k, E in enumerate(energies):
-                I_tot = I_MM_base.copy()
+                I_tot = I_MM.copy()
                 # Self terms
                 for i, er in enumerate(elem_results):
                     fp_i  = er['fp'][k]
@@ -417,7 +598,7 @@ class _GeneratorThread(QThread):
             # Ground-truth file — all partials
             from .core.decompose import partial_names_multi
             names_gt = partial_names_multi(n_elem)
-            cols_gt  = [q, I_MM_base]
+            cols_gt  = [q, I_MM]
             for i in range(n_elem):
                 cols_gt.append(I_RiM[i])
             for i in range(n_elem):
@@ -426,8 +607,8 @@ class _GeneratorThread(QThread):
                 for j in range(i+1, n_elem):
                     cols_gt.append(I_RiRj[(i,j)])
             hdr_gt = 'q(1/A)  ' + '  '.join(f'{nm}(cm-1)' for nm in names_gt)
-            scales_str = '  '.join(f'scale_{i+1}={scales[i]:.3f}' for i in range(n_elem))
-            hdr_gt = f'Resonant elements: {[e["Z"] for e in elem_results]}  {scales_str}\n' + hdr_gt
+            locs_str = '  '.join(f'loc_{i+1}={elem_results[i]["location"]}' for i in range(n_elem))
+            hdr_gt = f'Resonant elements: {[e["Z"] for e in elem_results]}  {locs_str}\n' + hdr_gt
             np.savetxt(out_dir / 'ground_truth_partials.dat',
                        np.column_stack(cols_gt), header=hdr_gt, fmt='%.6e')
             self.log_line.emit('\nground_truth_partials.dat saved.')
@@ -593,91 +774,149 @@ class SimDataTab(QWidget):
         btn_solv.clicked.connect(self._apply_solv_preset)
 
         # ── Energies ──────────────────────────────────────────────────────────
-        en_grp  = QGroupBox('Energies')
-        en_form = QFormLayout(en_grp)
+        en_grp = QGroupBox('Energies — per resonant element')
+        en_lay = QVBoxLayout(en_grp)
 
-        # Three resonant-element rows
-        self._sim_elem_Z:     list = []
-        self._sim_elem_amp:   list = []
-        self._sim_elem_chk:   list = []
-        self._sim_elem_lbl:   list = []
+        # Build element symbol list from xraydb (or static fallback)
+        _sym_list = []
+        if _HAS_XRAYDB:
+            for _Z in range(3, 93):
+                try:
+                    _sym_list.append((xraydb.atomic_symbol(_Z), _Z))
+                except Exception:
+                    pass
+        if not _sym_list:
+            _FALLBACK = ['Li','Be','B','C','N','O','F','Ne','Na','Mg','Al','Si','P','S',
+                         'Cl','Ar','K','Ca','Sc','Ti','V','Cr','Mn','Fe','Co','Ni','Cu',
+                         'Zn','Ga','Ge','As','Se','Br','Kr','Rb','Sr','Y','Zr','Nb','Mo',
+                         'Ru','Rh','Pd','Ag','Cd','In','Sn','Sb','Te','I','Xe','Cs','Ba',
+                         'La','Ce','Pr','Nd','Sm','Eu','Gd','Tb','Dy','Ho','Er','Tm','Yb',
+                         'Lu','Hf','Ta','W','Re','Os','Ir','Pt','Au','Hg','Tl','Pb','Bi',
+                         'Th','U']
+            _sym_list = [(_s, _z) for _z, _s in enumerate(_FALLBACK, start=3)]
 
-        elem_widget = QWidget()
-        elem_vlay   = QVBoxLayout(elem_widget)
-        elem_vlay.setContentsMargins(0, 0, 0, 0)
-        elem_vlay.setSpacing(3)
+        _SHELLS_ALL = ['K','L1','L2','L3','M1','M2','M3','M4','M5','N1','N2','N3']
+        _DEFAULT_ELEMS = [('Au', 79), ('Pt', 78), ('Se', 34)]
+        _DEFAULT_EDGES = ['L3', 'L3', 'K']
+
+        self._sim_elem_Z:          list = [0, 0, 0]
+        self._sim_elem_chk:        list = []
+        self._sim_elem_sym:        list = []   # QComboBox symbol
+        self._sim_elem_edge_combo: list = []   # QComboBox edge
+        self._sim_elem_lbl:        list = []   # QLabel edge energy
+        self._sim_elem_emin:       list = []   # QDoubleSpinBox
+        self._sim_elem_emax:       list = []   # QDoubleSpinBox
+        self._sim_elem_en:         list = []   # QSpinBox N
+        self._sim_elem_loc:        list = []   # QComboBox Core/Shell location
+
         for i in range(3):
-            row = QHBoxLayout()
+            ew = QWidget()
+            ev = QVBoxLayout(ew)
+            ev.setContentsMargins(0, 2, 0, 4)
+            ev.setSpacing(2)
+
+            # Row 1: enable checkbox / label  +  symbol combo  +  edge combo  +  edge label
+            r1 = QHBoxLayout()
             if i == 0:
-                row.addWidget(QLabel('Elem 1 (primary):'))
+                r1.addWidget(QLabel('Element 1:'))
                 chk = None
             else:
-                chk = QCheckBox(f'Elem {i+1}:')
+                chk = QCheckBox(f'Element {i+1}:')
                 chk.setChecked(False)
-                row.addWidget(chk)
+                r1.addWidget(chk)
             self._sim_elem_chk.append(chk)
 
-            row.addWidget(QLabel('Z:'))
-            z_sb = _int(79 - i*5, lo=1, hi=118)
-            z_sb.setFixedWidth(55)
-            self._sim_elem_Z.append(z_sb)
-            row.addWidget(z_sb)
+            sym_cb = QComboBox()
+            sym_cb.setMinimumWidth(95)
+            for sym, Z in _sym_list:
+                sym_cb.addItem(f'{sym} ({Z})')
+            # Set default selection
+            def_sym, def_Z = _DEFAULT_ELEMS[i]
+            idx_def = sym_cb.findText(f'{def_sym} ({def_Z})')
+            if idx_def >= 0:
+                sym_cb.setCurrentIndex(idx_def)
+            self._sim_elem_sym.append(sym_cb)
+            r1.addWidget(sym_cb)
 
-            row.addWidget(QLabel('Amp:'))
-            amp_sb = _dbl(1.0 if i == 0 else 0.5, lo=0.0, hi=100.0, decimals=3, step=0.05)
-            amp_sb.setFixedWidth(70)
-            self._sim_elem_amp.append(amp_sb)
-            row.addWidget(amp_sb)
+            edge_cb = QComboBox()
+            edge_cb.addItems(_SHELLS_ALL)
+            edge_cb.setCurrentText(_DEFAULT_EDGES[i])
+            edge_cb.setFixedWidth(52)
+            self._sim_elem_edge_combo.append(edge_cb)
+            r1.addWidget(edge_cb)
 
-            lbl = QLabel()
-            lbl.setStyleSheet('color: #666; font-size: 11px;')
-            lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-            self._sim_elem_lbl.append(lbl)
-            row.addWidget(lbl, 1)
-            elem_vlay.addLayout(row)
+            lbl_e = QLabel()
+            lbl_e.setStyleSheet('color: #888; font-size: 11px;')
+            lbl_e.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            self._sim_elem_lbl.append(lbl_e)
+            r1.addWidget(lbl_e, 1)
+            ev.addLayout(r1)
 
-            # Wire signals
-            z_sb.valueChanged.connect(lambda v, ei=i: self._update_sim_edge_info(ei))
+            # Row 2: E_min – E_max  N  Amp  (indented)
+            r2 = QHBoxLayout()
+            r2.addSpacing(16)
+            r2.addWidget(QLabel('E:'))
+            emin = _dbl(10.419, lo=0.1, hi=1000.0, decimals=4, step=0.01)
+            emin.setFixedWidth(78)
+            emax = _dbl(10.919, lo=0.1, hi=1000.0, decimals=4, step=0.01)
+            emax.setFixedWidth(78)
+            r2.addWidget(emin); r2.addWidget(QLabel('–')); r2.addWidget(emax)
+            r2.addWidget(QLabel('keV'))
+            r2.addSpacing(8)
+            r2.addWidget(QLabel('N:'))
+            n_sb = _int(20, lo=2, hi=200)
+            n_sb.setFixedWidth(52)
+            r2.addWidget(n_sb)
+            r2.addSpacing(8)
+            r2.addWidget(QLabel('Location:'))
+            loc_cb = QComboBox()
+            loc_cb.addItems(['Core', 'Shell'])
+            loc_cb.setCurrentText('Core' if i == 0 else 'Shell')
+            loc_cb.setFixedWidth(75)
+            r2.addWidget(loc_cb)
+            r2.addStretch()
+            self._sim_elem_emin.append(emin)
+            self._sim_elem_emax.append(emax)
+            self._sim_elem_en.append(n_sb)
+            self._sim_elem_loc.append(loc_cb)
+            ev.addLayout(r2)
+
+            if i != 0:
+                for w in (sym_cb, edge_cb, emin, emax, n_sb, loc_cb):
+                    w.setEnabled(False)
+
+            en_lay.addWidget(ew)
+
+            sym_cb.currentIndexChanged.connect(
+                lambda _, ei=i: self._on_sim_symbol_changed(ei))
+            edge_cb.currentIndexChanged.connect(
+                lambda _, ei=i: self._on_sim_edge_changed(ei))
             if chk is not None:
-                chk.toggled.connect(lambda checked, ei=i: self._sim_elem_Z[ei].setEnabled(checked)
-                                    or self._sim_elem_amp[ei].setEnabled(checked))
-                z_sb.setEnabled(False)
-                amp_sb.setEnabled(False)
-                chk.toggled.connect(lambda checked, ei=i: (
-                    self._sim_elem_Z[ei].setEnabled(checked),
-                    self._sim_elem_amp[ei].setEnabled(checked),
-                ))
-
-        en_form.addRow('Resonant elements:', elem_widget)
-
-        # Backward-compat alias — _exp_Z points to elem-1 spinbox
-        self._exp_Z    = self._sim_elem_Z[0]
-        self._lbl_edge = self._sim_elem_lbl[0]
-
-        self._exp_Emin = _dbl(10.919, lo=0.1, hi=1000.0, decimals=4, step=0.01)
-        self._exp_Emax = _dbl(11.919, lo=0.1, hi=1000.0, decimals=4, step=0.01)
-        self._exp_N    = _int(20, lo=2, hi=200)
-
-        en_form.addRow('E_min (keV):',  self._exp_Emin)
-        en_form.addRow('E_max (keV):',  self._exp_Emax)
-        en_form.addRow('N energies:',   self._exp_N)
+                chk.toggled.connect(
+                    lambda checked, ei=i: self._on_sim_elem_toggled(checked, ei))
 
         note = QLabel(
-            '<i>Energies are spaced for equal Δf′ steps across [E_min, E_max].<br>'
-            'Amp = relative resonant amplitude (1.0 = same as primary element).<br>'
-            'Cross-terms I_RiRj assume co-located resonant atoms.</i>')
+            '<i>Each element gets its own energy range near its absorption edge.<br>'
+            'Energies are spaced for equal Δf′ steps; ranges are combined into one<br>'
+            'shared grid.  Location sets which region of the particle each element<br>'
+            'occupies; Core/Shell pairs have distinct I(q) shapes for all partials.</i>')
         note.setWordWrap(True)
-        en_form.addRow(note)
+        en_lay.addWidget(note)
 
         self._btn_preview_E = QPushButton('Preview selected energies')
-        en_form.addRow(self._btn_preview_E)
+        en_lay.addWidget(self._btn_preview_E)
         form_lay.addWidget(en_grp)
 
-        self._exp_Z.valueChanged.connect(lambda v: self._update_sim_edge_info(0))
-        self._core_Z.valueChanged.connect(lambda v: self._exp_Z.setValue(v))
+        # Backward-compat aliases used by _build_config / _preview_energies
+        self._exp_Z    = None          # removed — use _sim_elem_sym[0]
+        self._lbl_edge = self._sim_elem_lbl[0]
+        self._exp_Emin = self._sim_elem_emin[0]
+        self._exp_Emax = self._sim_elem_emax[0]
+        self._exp_N    = self._sim_elem_en[0]
+
         self._btn_preview_E.clicked.connect(self._preview_energies)
         for i in range(3):
-            self._update_sim_edge_info(i)
+            self._on_sim_symbol_changed(i)
 
         # ── Sample ────────────────────────────────────────────────────────────
         samp_grp  = QGroupBox('Sample')
@@ -805,7 +1044,6 @@ class SimDataTab(QWidget):
                 Z = _element_Z(sym)
                 if Z:
                     self._core_Z.setValue(Z)
-                    self._exp_Z.setValue(Z)
             rho = self._core_rho.value()
             sld = _elec_density(rho, M, ne)
             self._lbl_core_sld.setText(f'M = {M:.3f} g/mol,  ne = {ne},  ρ_e = {sld:.3f} e/Å³')
@@ -850,7 +1088,6 @@ class SimDataTab(QWidget):
             self._core_rho.setValue(p['mass_density'])
             self._core_M.setValue(p['molar_mass'])
             self._core_ne.setValue(p['n_electrons'])
-            self._exp_Z.setValue(p['Z'])
 
     def _apply_shell_preset(self):
         nm = self._shell_preset.currentText()
@@ -874,24 +1111,93 @@ class SimDataTab(QWidget):
         else:
             self._lbl_thick.setText(f'{delta:.1f} Å')
 
-    def _update_sim_edge_info(self, elem_idx: int = 0):
+    def _elem_Z_from_combo(self, elem_idx: int) -> int:
+        """Return integer Z from the symbol combo for elem_idx."""
+        txt = self._sim_elem_sym[elem_idx].currentText()  # e.g. "Au (79)"
+        try:
+            return int(txt.split('(')[1].rstrip(')'))
+        except Exception:
+            return 0
+
+    def _on_sim_symbol_changed(self, elem_idx: int):
+        """Called when symbol combo changes — update Z, reset edge combo, update E range."""
+        Z = self._elem_Z_from_combo(elem_idx)
+        self._sim_elem_Z[elem_idx] = Z
         lbl = self._sim_elem_lbl[elem_idx]
+        edge_cb = self._sim_elem_edge_combo[elem_idx]
+
         if not _HAS_XRAYDB:
-            lbl.setText('xraydb not installed'); return
-        Z = self._sim_elem_Z[elem_idx].value()
+            lbl.setText('xraydb not installed')
+            return
+
+        # Rebuild edge combo with available edges for this Z
         try:
             edges = xraydb.xray_edges(Z)
-            parts = []
-            for sh in ['K', 'L3', 'L2', 'L1', 'M5']:
-                if sh in edges:
-                    parts.append(f'{sh}: {edges[sh].energy/1000:.3f} keV')
-                    if len(parts) == 3: break
-            lbl.setText('  '.join(parts))
         except Exception:
-            lbl.setText('')
+            edges = {}
+
+        _SHELLS_ALL = ['K','L1','L2','L3','M1','M2','M3','M4','M5','N1','N2','N3']
+        edge_cb.blockSignals(True)
+        prev = edge_cb.currentText()
+        edge_cb.clear()
+        available = [sh for sh in _SHELLS_ALL if sh in edges and edges[sh].energy > 100]
+        if not available:
+            available = [sh for sh in _SHELLS_ALL if sh in edges]
+        if not available:
+            available = ['K']
+        for sh in available:
+            edge_cb.addItem(sh)
+        if prev in available:
+            edge_cb.setCurrentText(prev)
+        else:
+            # Default: L3 for heavy elements, K for light
+            default = 'L3' if Z > 50 and 'L3' in available else available[0]
+            edge_cb.setCurrentText(default)
+        edge_cb.blockSignals(False)
+
+        self._on_sim_edge_changed(elem_idx)
+
+    def _on_sim_edge_changed(self, elem_idx: int):
+        """Called when edge combo changes — update E_max default and label."""
+        Z = self._sim_elem_Z[elem_idx]
+        if not isinstance(Z, int) or Z == 0:
+            Z = self._elem_Z_from_combo(elem_idx)
+            self._sim_elem_Z[elem_idx] = Z
+        shell = self._sim_elem_edge_combo[elem_idx].currentText()
+        lbl   = self._sim_elem_lbl[elem_idx]
+
+        if not _HAS_XRAYDB or Z == 0:
+            return
+        try:
+            edge_eV = xraydb.xray_edge(Z, shell).energy
+        except Exception:
+            lbl.setText('edge not found')
+            return
+
+        edge_keV = edge_eV / 1000.0
+        emax_sb = self._sim_elem_emax[elem_idx]
+        emin_sb = self._sim_elem_emin[elem_idx]
+        emax_sb.blockSignals(True); emin_sb.blockSignals(True)
+        emax_sb.setValue(edge_keV)
+        emin_sb.setValue(max(0.1, edge_keV - 0.5))
+        emax_sb.blockSignals(False); emin_sb.blockSignals(False)
+        lbl.setText(f'{shell} edge: {edge_keV:.4f} keV')
+
+    def _on_sim_elem_toggled(self, checked: bool, elem_idx: int):
+        """Enable/disable all widgets for element elem_idx."""
+        for w in (self._sim_elem_sym[elem_idx],
+                  self._sim_elem_edge_combo[elem_idx],
+                  self._sim_elem_emin[elem_idx],
+                  self._sim_elem_emax[elem_idx],
+                  self._sim_elem_en[elem_idx],
+                  self._sim_elem_loc[elem_idx]):
+            w.setEnabled(checked)
+
+    def _update_sim_edge_info(self, elem_idx: int = 0):
+        self._on_sim_edge_changed(elem_idx)
 
     def _update_edge_info(self):
-        self._update_sim_edge_info(0)
+        self._on_sim_edge_changed(0)
 
     def _browse_dir(self):
         d = QFileDialog.getExistingDirectory(self, 'Output directory', self._out_dir.text())
@@ -902,13 +1208,14 @@ class SimDataTab(QWidget):
             self._log.append('xraydb not installed'); return
         cfg = self._build_config()
         elems = cfg['resonant_elements']
-        self._log.append('<b>Energy preview:</b>')
-        self._log.append(
-            f'  {len(elems)} element(s): Z={[e["Z"] for e in elems]}  '
-            f'E: {cfg["experiment"]["E_min_keV"]:.4f}–{cfg["experiment"]["E_max_keV"]:.4f} keV  '
-            f'N={cfg["experiment"]["n_energies"]}')
+        self._log.append('<b>Energy preview (per element):</b>')
+        for i, e in enumerate(elems):
+            self._log.append(
+                f'  Elem {i+1}: Z={e["Z"]}  '
+                f'E: {e["E_min_keV"]:.4f}–{e["E_max_keV"]:.4f} keV  N={e["n_energies"]}')
         try:
             Es, elem_results = _select_energies_multi(cfg)
+            self._log.append(f'  Combined grid: {len(Es)} energies')
             n = len(elem_results)
             fp_hdrs  = ''.join(f"  {('fp_'+str(i+1)):>9}"  for i in range(n))
             fpp_hdrs = ''.join(f"  {('fpp_'+str(i+1)):>9}" for i in range(n))
@@ -932,13 +1239,24 @@ class SimDataTab(QWidget):
 
     def _build_config(self) -> dict:
         out_path = Path(self._out_dir.text()) / self._out_name.text()
-        # Collect active resonant elements
-        res_elems = [{'Z': self._sim_elem_Z[0].value(),
-                      'scale': self._sim_elem_amp[0].value()}]
+        # Collect active resonant elements with per-element energy ranges
+        res_elems = [{
+            'Z':          self._sim_elem_Z[0],
+            'location':   'core' if self._sim_elem_loc[0].currentText() == 'Core' else 'shell',
+            'E_min_keV':  self._sim_elem_emin[0].value(),
+            'E_max_keV':  self._sim_elem_emax[0].value(),
+            'n_energies': self._sim_elem_en[0].value(),
+        }]
         for i in range(1, 3):
             if self._sim_elem_chk[i] is not None and self._sim_elem_chk[i].isChecked():
-                res_elems.append({'Z':    self._sim_elem_Z[i].value(),
-                                  'scale': self._sim_elem_amp[i].value()})
+                res_elems.append({
+                    'Z':          self._sim_elem_Z[i],
+                    'location':   'core' if self._sim_elem_loc[i].currentText() == 'Core' else 'shell',
+                    'E_min_keV':  self._sim_elem_emin[i].value(),
+                    'E_max_keV':  self._sim_elem_emax[i].value(),
+                    'n_energies': self._sim_elem_en[i].value(),
+                })
+        Z0 = self._sim_elem_Z[0]
         return {
             'system': {'description': f'Z={self._core_Z.value()} core R_mean={self._core_R.value():.1f}A'},
             'core':   {'Z': self._core_Z.value(), 'mass_density': self._core_rho.value(),
@@ -950,9 +1268,10 @@ class SimDataTab(QWidget):
             'solvent':{'mass_density': self._solv_rho.value(), 'molar_mass': self._solv_M.value(),
                        'n_electrons': self._solv_ne.value()},
             'experiment': {'volume_fraction': self._exp_phi.value(),
-                           'resonant_Z': self._sim_elem_Z[0].value(),
-                           'E_min_keV': self._exp_Emin.value(), 'E_max_keV': self._exp_Emax.value(),
-                           'n_energies': self._exp_N.value()},
+                           'resonant_Z': Z0,
+                           'E_min_keV': res_elems[0]['E_min_keV'],
+                           'E_max_keV': res_elems[0]['E_max_keV'],
+                           'n_energies': res_elems[0]['n_energies']},
             'resonant_elements': res_elems,
             'q_grid': {'q_min': self._q_min.value(), 'q_max': self._q_max.value(),
                        'n_points': self._q_n.value(),
@@ -1019,24 +1338,36 @@ class SimDataTab(QWidget):
 
         e = cfg.get('experiment', {})
         if 'volume_fraction' in e: self._exp_phi.setValue(e['volume_fraction'])
-        if 'E_min_keV'       in e: self._exp_Emin.setValue(e['E_min_keV'])
-        if 'E_max_keV'       in e: self._exp_Emax.setValue(e['E_max_keV'])
-        if 'n_energies'      in e: self._exp_N.setValue(e['n_energies'])
 
         elems = cfg.get('resonant_elements', [])
-        if elems:
-            self._sim_elem_Z[0].setValue(elems[0].get('Z', 79))
-            self._sim_elem_amp[0].setValue(elems[0].get('scale', 1.0))
-        for i in range(1, 3):
-            chk = self._sim_elem_chk[i]
-            if chk is None:
+        for i in range(3):
+            active = i < len(elems)
+            if i > 0:
+                chk = self._sim_elem_chk[i]
+                if chk is not None:
+                    chk.setChecked(active)
+            if not active:
                 continue
-            if i < len(elems):
-                chk.setChecked(True)
-                self._sim_elem_Z[i].setValue(elems[i].get('Z', 79))
-                self._sim_elem_amp[i].setValue(elems[i].get('scale', 0.5))
-            else:
-                chk.setChecked(False)
+            elem = elems[i]
+            Z = elem.get('Z', 79)
+            # Restore symbol combo
+            sym_cb = self._sim_elem_sym[i]
+            for j in range(sym_cb.count()):
+                txt = sym_cb.itemText(j)
+                try:
+                    if int(txt.split('(')[1].rstrip(')')) == Z:
+                        sym_cb.setCurrentIndex(j)
+                        break
+                except Exception:
+                    pass
+            # Edge combo — don't auto-update; just set E_min/E_max/N directly
+            self._sim_elem_emin[i].setValue(elem.get('E_min_keV', 10.0))
+            self._sim_elem_emax[i].setValue(elem.get('E_max_keV', 11.0))
+            self._sim_elem_en[i].setValue(int(elem.get('n_energies', 20)))
+            loc = elem.get('location', 'core' if i == 0 else 'shell')
+            self._sim_elem_loc[i].setCurrentText('Core' if loc == 'core' else 'Shell')
+            # Trigger symbol change to update edge label
+            self._on_sim_symbol_changed(i)
 
         qg = cfg.get('q_grid', {})
         if 'q_min'    in qg: self._q_min.setValue(qg['q_min'])
@@ -1088,10 +1419,11 @@ class SimDataTab(QWidget):
         self._log.append(f'Core:    Z={cfg["core"]["Z"]}, R_mean={cfg["core"]["radius_mean"]:.1f} Å'
                          f', σ_rel={cfg["core"]["sigma_rel"]*100:.0f}%')
         self._log.append(f'Shell:   R_outer={cfg["shell"]["radius_outer"]:.1f} Å')
-        elem_str = '  '.join(f'Z={e["Z"]} amp={e["scale"]:.2f}' for e in elems)
+        elem_str = '  '.join(
+            f'Z={e["Z"]} loc={e.get("location","core")} '
+            f'E={e["E_min_keV"]:.4f}–{e["E_max_keV"]:.4f} keV N={e["n_energies"]}'
+            for e in elems)
         self._log.append(f'Elements ({len(elems)}): {elem_str}')
-        self._log.append(f'Energies:{cfg["experiment"]["E_min_keV"]:.4f}–{cfg["experiment"]["E_max_keV"]:.4f} keV'
-                         f'  ({cfg["experiment"]["n_energies"]} points, equidistant Δf′ for elem 1)')
         self._log.append(f'Output:  {cfg["output"]["directory"]}/')
         if settings_path:
             self._log.append(f'Settings: {settings_path.name}  (auto-saved)')
