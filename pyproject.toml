@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "asaxs-app"
+name = "prism"
 version = "0.1.0"
-description = "ASAXS q-space decomposition + IFT → partial PDDFs"
+description = "PRISM — Partial scattering Resolution via Intensity Spectral Modulation"
 requires-python = ">=3.11"
 dependencies = [
     "PyQt6",
@@ -19,7 +19,7 @@ dependencies = [
 hdf = ["h5py"]
 
 [project.scripts]
-asaxs-app = "asaxs_app.__main__:main"
+prism = "prism.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

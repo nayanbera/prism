@@ -71,6 +71,39 @@ def _wls_with_errors(A: np.ndarray, b: np.ndarray, w: np.ndarray
     return sol, errs
 
 
+def _ols_with_errors(A: np.ndarray, b: np.ndarray
+                     ) -> tuple[np.ndarray, np.ndarray]:
+    """OLS solve + residual-based 1σ errors.
+
+    Cov(x) = σ² (AᵀA)⁻¹  where σ² = ‖Ax - b‖² / (N - k)
+    and k = number of parameters.  This is the standard unbiased OLS
+    variance estimate — no measurement σ is used.
+    """
+    sol, residuals, rank, _ = lstsq(A, b, rcond=None)
+    N, k = A.shape
+    dof = N - k
+    if dof > 0 and len(residuals) > 0:
+        sigma2 = float(residuals[0]) / dof
+    else:
+        # lstsq returns empty residuals when rank < k; fall back to direct calc
+        sigma2 = float(np.sum((A @ sol - b) ** 2)) / max(dof, 1)
+    AtA = A.T @ A
+    try:
+        cov_diag = np.diag(inv(AtA)) * sigma2
+        errs = np.sqrt(np.maximum(cov_diag, 0.0))
+    except np.linalg.LinAlgError:
+        errs = np.full(len(sol), np.nan)
+    return sol, errs
+
+
+def _solve(A: np.ndarray, b: np.ndarray, w: np.ndarray, method: str
+           ) -> tuple[np.ndarray, np.ndarray]:
+    """Dispatch to WLS or OLS solver."""
+    if method == 'OLS':
+        return _ols_with_errors(A, b)
+    return _wls_with_errors(A, b, w)
+
+
 # ── Direct decomposition ──────────────────────────────────────────────────────
 
 def decompose(
@@ -79,9 +112,12 @@ def decompose(
     sigma_matrix: np.ndarray,
     fp: np.ndarray,
     fpp: np.ndarray,
+    method: str = 'WLS',
 ) -> tuple[np.ndarray, ...]:
     """
     Decompose energy-resolved SAXS into partial structure factors.
+
+    method : 'WLS' (default) or 'OLS'
 
     Returns
     -------
@@ -93,7 +129,7 @@ def decompose(
     errs  = np.zeros((3, NQ))
     for j in range(NQ):
         sig = np.maximum(sigma_matrix[:, j], 1e-30)
-        sol, e = _wls_with_errors(A, I_matrix[:, j], 1.0 / sig)
+        sol, e = _solve(A, I_matrix[:, j], 1.0 / sig, method)
         parts[:, j] = sol
         errs[:, j]  = e
     return parts[0], parts[1], parts[2], errs[0], errs[1], errs[2]
@@ -133,12 +169,15 @@ def decompose_difference(
     fp: np.ndarray,
     fpp: np.ndarray,
     ref_idx: int = 0,
+    method: str = 'WLS',
 ) -> tuple[np.ndarray, ...]:
     """
     Difference ASAXS decomposition — recovers I_RM and I_RR only.
 
     I_MM (energy-independent) cancels on subtraction; this mode is more
     robust because it removes systematic background and reduces κ.
+
+    method : 'WLS' (default) or 'OLS'
 
     Returns
     -------
@@ -157,7 +196,7 @@ def decompose_difference(
         # Combined σ for subtracted data: sqrt(σ_i² + σ_ref²)
         sig = np.sqrt(sigma_matrix[mask, j]**2 + sig_ref[j]**2)
         sig = np.maximum(sig, 1e-30)
-        sol, e = _wls_with_errors(A_diff, dI, 1.0 / sig)
+        sol, e = _solve(A_diff, dI, 1.0 / sig, method)
         parts[:, j] = sol
         errs[:, j]  = e
 
@@ -269,6 +308,7 @@ def decompose_multi_per_edge(
     edge_groups: np.ndarray,
     beta: np.ndarray | None = None,
     include_cross: bool = True,
+    method: str = 'WLS',
 ) -> dict:
     """Global WLS with per-edge offset columns for N-element ASAXS.
 
@@ -326,7 +366,7 @@ def decompose_multi_per_edge(
         A = build_A(fp0, fpp0)
         for j in range(NQ):
             sig = np.maximum(sig_use[:, j], 1e-30)
-            sol, e = _wls_with_errors(A, I_use[:, j], 1.0 / sig)
+            sol, e = _solve(A, I_use[:, j], 1.0 / sig, method)
             parts[MM_idx,    j] = sol[0]; errs[MM_idx,    j] = e[0]
             parts[RM_idx[0], j] = sol[1]; errs[RM_idx[0], j] = e[1]
             parts[RR_idx[0], j] = sol[2]; errs[RR_idx[0], j] = e[2]
@@ -356,7 +396,7 @@ def decompose_multi_per_edge(
 
     for qi in range(NQ):
         sig = np.maximum(sig_use[:, qi], 1e-30)
-        sol, e = _wls_with_errors(A_ext, I_use[:, qi], 1.0 / sig)
+        sol, e = _solve(A_ext, I_use[:, qi], 1.0 / sig, method)
         phys_sols[:, qi] = sol[N_groups:]
         for k, g in enumerate(unique_groups):
             gi = int(g)
@@ -396,6 +436,7 @@ def decompose_multi(
     beta: np.ndarray | None = None,
     edge_groups: np.ndarray | None = None,
     include_cross: bool = False,
+    method: str = 'WLS',
 ) -> dict:
     """Multi-element direct decomposition.
     elements: list of (fp, fpp) pairs.
@@ -403,6 +444,7 @@ def decompose_multi(
           each element-i dataset is divided by beta[i] before solving.
     edge_groups: optional (N_E,) int array assigning each energy to an element index.
     include_cross: include cross-terms I_RiRj in the model (see partial_names_multi).
+    method: 'WLS' (default) or 'OLS'
     Returns dict with keys:
       'names'    : list of partial names (length n_cols)
       'partials' : ndarray (n_cols, NQ) — best-fit values
@@ -424,7 +466,7 @@ def decompose_multi(
 
     for j in range(NQ):
         sig = np.maximum(sig_use[:, j], 1e-30)
-        sol, e = _wls_with_errors(A, I_use[:, j], 1.0 / sig)
+        sol, e = _solve(A, I_use[:, j], 1.0 / sig, method)
         parts[:, j] = sol
         errs[:, j]  = e
     return {'names': names, 'partials': parts, 'errors': errs}

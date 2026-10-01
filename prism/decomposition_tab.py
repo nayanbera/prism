@@ -95,6 +95,16 @@ class DecompositionTab(QWidget):
         self._combo_ref.setMinimumWidth(160)
         top.addWidget(self._combo_ref)
 
+        top.addWidget(QLabel('Method:'))
+        self._combo_method = QComboBox()
+        self._combo_method.addItems(['WLS', 'OLS'])
+        self._combo_method.setToolTip(
+            'WLS — Weighted Least Squares: each energy weighted by 1/σ².\n'
+            'OLS — Ordinary Least Squares: all energies treated equally.\n'
+            'WLS is recommended when σ values are reliable.')
+        self._combo_method.setFixedWidth(60)
+        top.addWidget(self._combo_method)
+
         self._chk_log = QCheckBox('Log I')
         self._chk_log.setChecked(True)
         self._chk_log.toggled.connect(self._update_log)
@@ -680,6 +690,7 @@ class DecompositionTab(QWidget):
 
         diff_mode = self._chk_diff.isChecked()
         ref_idx   = self._combo_ref.currentIndex()
+        method    = self._combo_method.currentText()
 
         # Apply q range mask
         qmask = ((self._q >= self._spin_qmin.value()) &
@@ -696,7 +707,7 @@ class DecompositionTab(QWidget):
         try:
             if diff_mode:
                 I_RM, I_RR, s_RM, s_RR = decompose_difference(
-                    q, I, sig, self._fp, self._fpp, ref_idx)
+                    q, I, sig, self._fp, self._fpp, ref_idx, method=method)
                 I_MM = np.zeros_like(I_RM)
                 s_MM = np.zeros_like(I_RM)
                 # Multi-element result (diff mode — use element 0 only)
@@ -745,10 +756,12 @@ class DecompositionTab(QWidget):
                 if n_elems > 1 and edge_groups_all is not None:
                     mr = decompose_multi_per_edge(q, I, sig, elems,
                                                   edge_groups_all, beta=beta_opt,
-                                                  include_cross=(n_elems > 1))
+                                                  include_cross=(n_elems > 1),
+                                                  method=method)
                 else:
                     mr = decompose_multi(q, I, sig, elems,
-                                         beta=beta_opt, edge_groups=edge_groups)
+                                         beta=beta_opt, edge_groups=edge_groups,
+                                         method=method)
                 # Extract element-0 partials for backward compat
                 names = mr['names']
                 parts = mr['partials']

@@ -32,7 +32,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._decomp_tab, '3 · q-space decomp')
         tabs.addTab(self._ift_tab,    '4 · IFT (q-first)')
         tabs.addTab(self._export_tab, '5 · Export')
-        tabs.addTab(self._sim_tab,    '6 · Sim data')
+        tabs.addTab(self._sim_tab,    '6 · Sim/Fit')
 
         self._status = QStatusBar()
         self.setStatusBar(self._status)
@@ -46,6 +46,7 @@ class MainWindow(QMainWindow):
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _on_datasets_changed(self, datasets: list):
         energies = [d['energy'] for d in datasets]
+        self._sim_tab.set_datasets(datasets)
 
         if len(datasets) >= 3:
             result = self._data_tab.get_common_grid()
@@ -64,6 +65,7 @@ class MainWindow(QMainWindow):
 
     def _on_decomposition_done(self, q, I_MM, I_RM, I_RR, s_MM, s_RM, s_RR):
         self._ift_tab.set_partials(q, I_MM, I_RM, I_RR, s_MM, s_RM, s_RR)
+        self._sim_tab.set_partials(q, I_MM, I_RM, I_RR, s_MM, s_RM, s_RR)
         result = self._decomp_tab.get_result()
         if result:
             self._export_tab.set_decomposition(result)
