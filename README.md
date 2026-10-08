@@ -10,7 +10,7 @@ A PyQt6 desktop application for analysing anomalous small-angle X-ray scattering
 
 | Tab | Function |
 |-----|----------|
-| **1 · Data** | Load multi-energy `.dat` files, interpolate to a common q grid, compute f′(E) / f″(E) via xraylib |
+| **1 · Data** | Load multi-energy `.dat` files, interpolate to a common q grid, compute f′(E) / f″(E) via xraydb |
 | **2 · Anomalous factors** | Inspect and edit the anomalous dispersion correction per element |
 | **3 · q-space decomp** | Least-squares decomposition of I(q, E) → partial intensities I_AA, I_AB, I_BB |
 | **4 · IFT** | Morozov-regularised indirect Fourier transform → p(r) PDDFs; chi² tuning, p(D_max)=0 boundary condition, optional background fit |
@@ -27,7 +27,7 @@ cd prism
 pip install -e .
 ```
 
-**Requirements:** Python ≥ 3.11, PyQt6, pyqtgraph, numpy, scipy, xraylib
+**Requirements:** Python ≥ 3.11, PyQt6, pyqtgraph, numpy, scipy, xraydb
 
 Optional HDF5 export: `pip install -e ".[hdf]"`
 

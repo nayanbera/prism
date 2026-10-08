@@ -12,7 +12,7 @@ dependencies = [
     "pyqtgraph",
     "numpy",
     "scipy",
-    "xraylib",
+    "xraydb",
 ]
 
 [project.optional-dependencies]

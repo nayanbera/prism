@@ -408,13 +408,16 @@ class DataTab(QWidget):
 
     def _update_element_presets(self, elem_idx: int = 0):
         from .anomalous_tab import _edge_energy_keV, _SHELLS
+        status = self._elem_lbl_status[elem_idx]
         try:
             import xraydb
         except ImportError:
+            status.setText('xraydb not installed — run: pip install xraydb')
             return
         active = [d for d in self._datasets
                   if d.get('active', True) and d['energy'] is not None]
         if not active:
+            status.setText('no energies found — set energies in the file table')
             return
         energies = np.array([d['energy'] for d in active])
         e_min, e_max = float(energies.min()), float(energies.max())
@@ -433,6 +436,11 @@ class DataTab(QWidget):
                 label = f'{sym} ({Z}) — {shell}  [{e_edge:.4f} keV]'
                 candidates.append((score, Z, shell, label))
         candidates.sort(key=lambda x: (-x[0], x[1]))
+        if not candidates:
+            status.setText(f'no absorption edge within {e_min:.2f}–{e_max:.2f} keV '
+                           '(energies must be in keV)')
+        elif status.text().startswith(('xraydb', 'no ')):
+            status.setText('')
         new_map = {lbl: (Z, sh) for _, Z, sh, lbl in candidates}
 
         combo    = self._elem_combo[elem_idx]

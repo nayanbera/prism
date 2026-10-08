@@ -20,6 +20,7 @@ import pyqtgraph as pg
 
 from .core.crosshair import add_crosshair
 from .core.multilayer_sphere import (
+    _HAS_NUMBA,
     compute_multilayer as _compute_multilayer,
     elec_density as _elec_density,
     atom_volume as _atom_volume,
