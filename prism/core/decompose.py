@@ -17,6 +17,7 @@ Multi-element support (N=1..3):
 
 import numpy as np
 from numpy.linalg import lstsq, inv
+from scipy.optimize import lsq_linear, minimize
 
 
 def build_A(fp: np.ndarray, fpp: np.ndarray) -> np.ndarray:
@@ -33,7 +34,10 @@ def cauchy_schwarz_ratio(
 ) -> np.ndarray:
     """CS(q) = I_RM² / (|I_MM|·|I_RR|).  Values > 1 violate the physical constraint."""
     denom = np.abs(I_MM) * np.abs(I_RR)
-    return np.where(denom > 0, I_RM**2 / denom, 0.0)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ratio = I_RM**2 / denom
+    # I_MM·I_RR = 0 with I_RM ≠ 0 is a violation (e.g. I_RR clamped to 0)
+    return np.where(denom > 0, ratio, np.where(I_RM**2 > 0, np.inf, 0.0))
 
 
 def enforce_cauchy_schwarz(
@@ -96,12 +100,104 @@ def _ols_with_errors(A: np.ndarray, b: np.ndarray
     return sol, errs
 
 
-def _solve(A: np.ndarray, b: np.ndarray, w: np.ndarray, method: str
+def _cs_feasible(x: np.ndarray, cs: list, rtol: float = 1e-9) -> bool:
+    return all(x[m] * x[r] - x[k] ** 2 >= -rtol * (abs(x[m] * x[r]) + x[k] ** 2)
+               for m, k, r in cs)
+
+
+def _make_cs_feasible(x: np.ndarray, cs: list) -> np.ndarray:
+    """Raise I_RR (the weakest term) to I_RM²/I_MM; if I_MM = 0 set I_RM = 0."""
+    x = x.copy()
+    for m, k, r in cs:
+        if x[m] > 0:
+            x[r] = max(x[r], x[k] ** 2 / x[m])
+        else:
+            x[k] = 0.0
+    return x
+
+
+def _constrained_solution(Aw: np.ndarray, bw: np.ndarray, x_u: np.ndarray,
+                          errs: np.ndarray, lo: np.ndarray, cs: list
+                          ) -> np.ndarray:
+    """Minimise ‖Aw·x − bw‖² subject to x ≥ lo and, for each (mm, rm, rr) in
+    cs, the Cauchy-Schwarz inequality x[rm]² ≤ x[mm]·x[rr] (a convex cone).
+
+    Starts from the unconstrained solution x_u and only does work where it
+    violates a constraint.  errs (1σ of the unconstrained fit) set the
+    parameter scales for the SLSQP step.
+    """
+    x = x_u
+    if np.any(x < lo):
+        x = lsq_linear(Aw, bw, bounds=(lo, np.inf), method='bvls',
+                       tol=1e-12).x
+    if not cs or _cs_feasible(x, cs):
+        return x
+
+    n = len(x)
+    scale = np.where(np.isfinite(errs) & (errs > 0), errs,
+                     np.maximum(np.abs(x), 1e-30))
+    As = Aw * scale
+    start = x.copy()
+    for m, k, r in cs:                       # feasible interior-ish start
+        start[m] = max(start[m], 1e-3 * scale[m])
+    start = _make_cs_feasible(start, cs)
+
+    cons = []
+    for m, k, r in cs:
+        ratio = scale[k] ** 2 / (scale[m] * scale[r])
+        def g(y, m=m, k=k, r=r, ratio=ratio):
+            return y[m] * y[r] - ratio * y[k] ** 2
+        def gj(y, m=m, k=k, r=r, ratio=ratio):
+            J = np.zeros(n)
+            J[m], J[r], J[k] = y[r], y[m], -2.0 * ratio * y[k]
+            return J
+        cons.append({'type': 'ineq', 'fun': g, 'jac': gj})
+
+    res = minimize(
+        lambda y: 0.5 * np.sum((As @ y - bw) ** 2),
+        start / scale, jac=lambda y: As.T @ (As @ y - bw),
+        bounds=[(l / sc if np.isfinite(l) else None, None)
+                for l, sc in zip(lo, scale)],
+        constraints=cons, method='SLSQP',
+        options={'maxiter': 200, 'ftol': 1e-14})
+    out = _make_cs_feasible(res.x * scale, cs)   # remove round-off violations
+    out = np.maximum(out, lo)
+    if not _cs_feasible(out, cs):                # solver failed: safe fallback
+        out = _make_cs_feasible(np.maximum(x, lo), cs)
+    return out
+
+
+def _solve(A: np.ndarray, b: np.ndarray, w: np.ndarray, method: str,
+           lb: np.ndarray | None = None, cs: list | None = None
            ) -> tuple[np.ndarray, np.ndarray]:
-    """Dispatch to WLS or OLS solver."""
+    """Dispatch to WLS or OLS solver, optionally constrained.
+
+    lb : per-column lower bounds (None = unconstrained).
+    cs : list of (i_MM, i_RM, i_RR) column triples to enforce
+         I_RM² ≤ I_MM·I_RR on.
+    Returned errors are always those of the unconstrained fit.
+    """
     if method == 'OLS':
-        return _ols_with_errors(A, b)
-    return _wls_with_errors(A, b, w)
+        sol, errs = _ols_with_errors(A, b)
+        w_eff = np.ones(len(b))
+    else:
+        sol, errs = _wls_with_errors(A, b, w)
+        w_eff = w
+    if lb is None and not cs:
+        return sol, errs
+    lo = np.full(A.shape[1], -np.inf) if lb is None else np.asarray(lb, float)
+    sol = _constrained_solution(A * w_eff[:, None], b * w_eff, sol, errs, lo,
+                                cs or [])
+    return sol, errs
+
+
+def solve_partials(A: np.ndarray, b: np.ndarray, sigma: np.ndarray,
+                   method: str = 'WLS', nonneg: bool = True,
+                   enforce_cs: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """Single-q solve for the 3-column [I_MM, I_RM, I_RR] model (public helper)."""
+    lb = [0.0, -np.inf, 0.0] if (nonneg or enforce_cs) else None
+    cs = [(0, 1, 2)] if enforce_cs else None
+    return _solve(A, b, 1.0 / np.maximum(sigma, 1e-30), method, lb, cs)
 
 
 # ── Direct decomposition ──────────────────────────────────────────────────────
@@ -113,11 +209,15 @@ def decompose(
     fp: np.ndarray,
     fpp: np.ndarray,
     method: str = 'WLS',
+    nonneg: bool = True,
+    enforce_cs: bool = False,
 ) -> tuple[np.ndarray, ...]:
     """
     Decompose energy-resolved SAXS into partial structure factors.
 
-    method : 'WLS' (default) or 'OLS'
+    method     : 'WLS' (default) or 'OLS'
+    nonneg     : constrain I_MM ≥ 0 and I_RR ≥ 0 (physical: |F|² terms)
+    enforce_cs : also constrain I_RM² ≤ I_MM·I_RR (implies the above)
 
     Returns
     -------
@@ -125,11 +225,13 @@ def decompose(
     """
     A  = build_A(fp, fpp)
     NQ = len(q)
+    lb = [0.0, -np.inf, 0.0] if (nonneg or enforce_cs) else None
+    cs = [(0, 1, 2)] if enforce_cs else None
     parts = np.zeros((3, NQ))
     errs  = np.zeros((3, NQ))
     for j in range(NQ):
         sig = np.maximum(sigma_matrix[:, j], 1e-30)
-        sol, e = _solve(A, I_matrix[:, j], 1.0 / sig, method)
+        sol, e = _solve(A, I_matrix[:, j], 1.0 / sig, method, lb, cs)
         parts[:, j] = sol
         errs[:, j]  = e
     return parts[0], parts[1], parts[2], errs[0], errs[1], errs[2]
@@ -170,6 +272,7 @@ def decompose_difference(
     fpp: np.ndarray,
     ref_idx: int = 0,
     method: str = 'WLS',
+    nonneg: bool = True,
 ) -> tuple[np.ndarray, ...]:
     """
     Difference ASAXS decomposition — recovers I_RM and I_RR only.
@@ -178,6 +281,7 @@ def decompose_difference(
     robust because it removes systematic background and reduces κ.
 
     method : 'WLS' (default) or 'OLS'
+    nonneg : constrain I_RR ≥ 0 (I_RM is signed; there is no I_MM here)
 
     Returns
     -------
@@ -196,7 +300,8 @@ def decompose_difference(
         # Combined σ for subtracted data: sqrt(σ_i² + σ_ref²)
         sig = np.sqrt(sigma_matrix[mask, j]**2 + sig_ref[j]**2)
         sig = np.maximum(sig, 1e-30)
-        sol, e = _solve(A_diff, dI, 1.0 / sig, method)
+        sol, e = _solve(A_diff, dI, 1.0 / sig, method,
+                        [-np.inf, 0.0] if nonneg else None)
         parts[:, j] = sol
         errs[:, j]  = e
 
@@ -300,6 +405,22 @@ def condition_number_multi(elements: list, include_cross: bool = False) -> float
     return float(np.linalg.cond(build_A_multi(elements, include_cross=include_cross)))
 
 
+def _multi_constraints(names: list, n_elem: int, nonneg: bool,
+                       enforce_cs: bool) -> tuple[list | None, list | None]:
+    """Column lower bounds and C-S triples for a partial_names_multi layout."""
+    if not (nonneg or enforce_cs):
+        return None, None
+    lb = np.full(len(names), -np.inf)
+    lb[names.index('I_MM')] = 0.0
+    for i in range(n_elem):
+        lb[names.index(f'I_R{i+1}R{i+1}')] = 0.0
+    cs = None
+    if enforce_cs:
+        cs = [(names.index('I_MM'), names.index(f'I_R{i+1}M'),
+               names.index(f'I_R{i+1}R{i+1}')) for i in range(n_elem)]
+    return lb, cs
+
+
 def decompose_multi_per_edge(
     q: np.ndarray,
     I_matrix: np.ndarray,
@@ -309,6 +430,8 @@ def decompose_multi_per_edge(
     beta: np.ndarray | None = None,
     include_cross: bool = True,
     method: str = 'WLS',
+    nonneg: bool = True,
+    enforce_cs: bool = False,
 ) -> dict:
     """Global WLS with per-edge offset columns for N-element ASAXS.
 
@@ -332,6 +455,13 @@ def decompose_multi_per_edge(
 
     I_MM is estimated as the average of the per-edge intercepts after
     subtracting each edge's mean contribution from the other elements.
+
+    nonneg: I_RiRi ≥ 0 inside the solve; I_MM (derived afterwards) is clipped
+            at 0.
+    enforce_cs: because I_MM is not a column of the extended fit, I_RiM² ≤
+            I_MM·I_RiRi is applied afterwards by raising I_RiRi to
+            I_RiM²/I_MM where violated (not a joint constrained fit); where
+            I_MM is clipped to 0, I_RiM is set to 0.
     """
     N_elem = len(elements)
     NQ     = len(q)
@@ -364,9 +494,11 @@ def decompose_multi_per_edge(
         # Single group: fall back to standard 3-param fit (no cross-term for 1 element)
         fp0, fpp0 = elements[0]
         A = build_A(fp0, fpp0)
+        lb1 = [0.0, -np.inf, 0.0] if (nonneg or enforce_cs) else None
+        cs1 = [(0, 1, 2)] if enforce_cs else None
         for j in range(NQ):
             sig = np.maximum(sig_use[:, j], 1e-30)
-            sol, e = _solve(A, I_use[:, j], 1.0 / sig, method)
+            sol, e = _solve(A, I_use[:, j], 1.0 / sig, method, lb1, cs1)
             parts[MM_idx,    j] = sol[0]; errs[MM_idx,    j] = e[0]
             parts[RM_idx[0], j] = sol[1]; errs[RM_idx[0], j] = e[1]
             parts[RR_idx[0], j] = sol[2]; errs[RR_idx[0], j] = e[2]
@@ -390,13 +522,18 @@ def decompose_multi_per_edge(
         fp_j, fpp_j = elements[j]
         A_ext[:, N_groups + 2*N_elem + c] = 2.0 * (fp_i*fp_j + fpp_i*fpp_j)
 
+    lb_ext = None
+    if nonneg or enforce_cs:
+        lb_ext = np.full(n_ext, -np.inf)
+        lb_ext[N_groups + N_elem: N_groups + 2 * N_elem] = 0.0   # I_RiRi ≥ 0
+
     C_local    = np.full((N_elem, NQ), np.nan)
     # Physical part of WLS solution for each q (used to recover I_MM)
     phys_sols  = np.zeros((n_ext - N_groups, NQ))
 
     for qi in range(NQ):
         sig = np.maximum(sig_use[:, qi], 1e-30)
-        sol, e = _solve(A_ext, I_use[:, qi], 1.0 / sig, method)
+        sol, e = _solve(A_ext, I_use[:, qi], 1.0 / sig, method, lb_ext)
         phys_sols[:, qi] = sol[N_groups:]
         for k, g in enumerate(unique_groups):
             gi = int(g)
@@ -425,6 +562,18 @@ def decompose_multi_per_edge(
         parts[MM_idx, qi] = float(np.sum(w2 * residual) / total_w2)
         errs[MM_idx, qi]  = float(1.0 / np.sqrt(total_w2))
 
+    if nonneg or enforce_cs:
+        np.maximum(parts[MM_idx], 0.0, out=parts[MM_idx])
+    if enforce_cs:
+        for i in range(N_elem):
+            for qi in range(NQ):
+                mm = parts[MM_idx, qi]
+                if mm > 0:
+                    parts[RR_idx[i], qi] = max(parts[RR_idx[i], qi],
+                                               parts[RM_idx[i], qi] ** 2 / mm)
+                else:                       # I_MM clipped to 0 → I_RiM must be 0
+                    parts[RM_idx[i], qi] = 0.0
+
     return {'names': names, 'partials': parts, 'errors': errs, 'C_local': C_local}
 
 
@@ -437,6 +586,8 @@ def decompose_multi(
     edge_groups: np.ndarray | None = None,
     include_cross: bool = False,
     method: str = 'WLS',
+    nonneg: bool = True,
+    enforce_cs: bool = False,
 ) -> dict:
     """Multi-element direct decomposition.
     elements: list of (fp, fpp) pairs.
@@ -445,6 +596,8 @@ def decompose_multi(
     edge_groups: optional (N_E,) int array assigning each energy to an element index.
     include_cross: include cross-terms I_RiRj in the model (see partial_names_multi).
     method: 'WLS' (default) or 'OLS'
+    nonneg: constrain I_MM ≥ 0 and every I_RiRi ≥ 0 (cross-terms stay signed)
+    enforce_cs: also constrain I_RiM² ≤ I_MM·I_RiRi for every element
     Returns dict with keys:
       'names'    : list of partial names (length n_cols)
       'partials' : ndarray (n_cols, NQ) — best-fit values
@@ -464,9 +617,10 @@ def decompose_multi(
         I_use   = I_matrix    / scale[:, None]
         sig_use = sigma_matrix / scale[:, None]
 
+    lb, cs = _multi_constraints(names, len(elements), nonneg, enforce_cs)
     for j in range(NQ):
         sig = np.maximum(sig_use[:, j], 1e-30)
-        sol, e = _solve(A, I_use[:, j], 1.0 / sig, method)
+        sol, e = _solve(A, I_use[:, j], 1.0 / sig, method, lb, cs)
         parts[:, j] = sol
         errs[:, j]  = e
     return {'names': names, 'partials': parts, 'errors': errs}

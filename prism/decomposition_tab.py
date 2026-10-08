@@ -20,7 +20,7 @@ import pyqtgraph as pg
 from .core.crosshair import add_crosshair
 from .core.decompose import (
     decompose, decompose_difference, stuhrmann_analysis, condition_number,
-    cauchy_schwarz_ratio, enforce_cauchy_schwarz,
+    cauchy_schwarz_ratio, solve_partials,
     decompose_multi, decompose_multi_per_edge, build_A_multi, condition_number_multi,
     compute_edge_groups, compute_edge_groups_by_energy, estimate_normalization_lowq,
 )
@@ -120,11 +120,22 @@ class DecompositionTab(QWidget):
         self._chk_errbar.toggled.connect(self._refresh_errorbars)
         top.addWidget(self._chk_errbar)
 
+        self._chk_nonneg = QCheckBox('I_MM, I_RR ≥ 0')
+        self._chk_nonneg.setChecked(True)
+        self._chk_nonneg.setToolTip(
+            'Constrain the fit so I_MM(q) ≥ 0 and I_RR(q) ≥ 0 (they are |F|²\n'
+            'terms and cannot be negative).  Applies to direct and difference\n'
+            'mode (difference mode has no I_MM).  I_RM and cross-terms stay\n'
+            'signed.  Error bars are those of the unconstrained fit.\n'
+            'Re-run decomposition to apply.')
+        top.addWidget(self._chk_nonneg)
+
         self._chk_cs_enforce = QCheckBox('Enforce C-S')
         self._chk_cs_enforce.setToolTip(
-            'Clamp I_RM(q) to ±√(I_MM·I_RR) wherever the Cauchy-Schwarz\n'
-            'inequality I_RM² ≤ I_MM·I_RR is violated (direct mode only).\n'
-            'Re-run decomposition to apply.')
+            'Constrain the fit so the Cauchy-Schwarz inequality\n'
+            'I_RM² ≤ I_MM·I_RR holds at every q (direct mode only; implies\n'
+            'I_MM, I_RR ≥ 0).  For multi-edge fits the inequality is applied\n'
+            'after the fit by raising I_RiRi.  Re-run decomposition to apply.')
         top.addWidget(self._chk_cs_enforce)
 
         self._btn_lp = QPushButton('I_RR bounds (LP)')
@@ -696,6 +707,8 @@ class DecompositionTab(QWidget):
         diff_mode = self._chk_diff.isChecked()
         ref_idx   = self._combo_ref.currentIndex()
         method    = self._combo_method.currentText()
+        nonneg    = self._chk_nonneg.isChecked()
+        enforce_cs = self._chk_cs_enforce.isChecked() and not diff_mode
 
         # Apply q range mask
         qmask = ((self._q >= self._spin_qmin.value()) &
@@ -712,7 +725,8 @@ class DecompositionTab(QWidget):
         try:
             if diff_mode:
                 I_RM, I_RR, s_RM, s_RR = decompose_difference(
-                    q, I, sig, self._fp, self._fpp, ref_idx, method=method)
+                    q, I, sig, self._fp, self._fpp, ref_idx, method=method,
+                    nonneg=nonneg)
                 I_MM = np.zeros_like(I_RM)
                 s_MM = np.zeros_like(I_RM)
                 # Multi-element result (diff mode — use element 0 only)
@@ -762,11 +776,14 @@ class DecompositionTab(QWidget):
                     mr = decompose_multi_per_edge(q, I, sig, elems,
                                                   edge_groups_all, beta=beta_opt,
                                                   include_cross=(n_elems > 1),
-                                                  method=method)
+                                                  method=method,
+                                                  nonneg=nonneg,
+                                                  enforce_cs=enforce_cs)
                 else:
                     mr = decompose_multi(q, I, sig, elems,
                                          beta=beta_opt, edge_groups=edge_groups,
-                                         method=method)
+                                         method=method, nonneg=nonneg,
+                                         enforce_cs=enforce_cs)
                 # Extract element-0 partials for backward compat
                 names = mr['names']
                 parts = mr['partials']
@@ -782,20 +799,12 @@ class DecompositionTab(QWidget):
             self._lbl_status.setText(f'Error: {e}')
             return
 
-        # Cauchy-Schwarz diagnostic and optional enforcement (direct mode only)
+        # Cauchy-Schwarz diagnostic (direct mode only).  Enforcement, if requested,
+        # already happened inside the constrained solve.
         n_viol = 0
         if not diff_mode:
-            cs_ratio_raw = cauchy_schwarz_ratio(I_MM, I_RM, I_RR)
-            n_viol = int((cs_ratio_raw > 1.0).sum())
-            if self._chk_cs_enforce.isChecked() and n_viol > 0:
-                I_RR = enforce_cauchy_schwarz(I_MM, I_RM, I_RR)
-                s_RR = s_RR.copy()
-                s_RR[cs_ratio_raw > 1.0] = 0.0
-                # Update in multi_result too
-                if multi_result is not None:
-                    idx_RR = multi_result['names'].index('I_R1R1')
-                    multi_result['partials'][idx_RR] = I_RR
             cs_ratio = cauchy_schwarz_ratio(I_MM, I_RM, I_RR)
+            n_viol = int((cs_ratio > 1.0 + 1e-6).sum())
         else:
             cs_ratio = np.zeros_like(I_RM)
 
@@ -824,7 +833,7 @@ class DecompositionTab(QWidget):
         elif n_viol == 0:
             cs_str = '  |  C-S: OK'
         elif self._chk_cs_enforce.isChecked():
-            cs_str = f'  |  C-S: {n_viol}/{len(q)} → enforced'
+            cs_str = f'  |  C-S: enforced ({n_viol} residual violations)'
         else:
             cs_str = f'  |  C-S: {n_viol}/{len(q)} violated'
         n_elems = len(self._elements) if self._elements else 1
@@ -934,6 +943,7 @@ class DecompositionTab(QWidget):
         ok  = cs <= 1.0
         vio = ~ok
         xq  = self._xq(q)           # ScatterPlotItem lives in ViewBox coords
+        cs  = np.minimum(cs, 2.0)   # keep infinite / huge violations on-screen
         self._curve_cs.setData(q, cs)
         self._pts_cs_ok.setData( x=xq[ok],  y=cs[ok])
         self._pts_cs_vio.setData(x=xq[vio], y=cs[vio])
@@ -1244,7 +1254,10 @@ class DecompositionTab(QWidget):
             A_loc = build_A(fp_m, fpp_m)
             w     = 1.0 / np.maximum(sig_m, 1e-30)
             Aw = A_loc * w[:, None]
-            sol, *_ = lstsq(Aw, I_marginal * w, rcond=None)
+            sol, _e = solve_partials(
+                A_loc, I_marginal, 1.0 / w, 'WLS',
+                nonneg=self._chk_nonneg.isChecked(),
+                enforce_cs=self._chk_cs_enforce.isChecked())
             I_MM_j, I_RM_j, I_RR_j = sol
             try:
                 loc_err = np.sqrt(np.maximum(np.diag(np.linalg.inv(Aw.T @ Aw)), 0))
