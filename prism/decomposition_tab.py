@@ -109,6 +109,11 @@ class DecompositionTab(QWidget):
         self._chk_log.setChecked(True)
         self._chk_log.toggled.connect(self._update_log)
         top.addWidget(self._chk_log)
+        self._chk_logq = QCheckBox('Log q')
+        self._chk_logq.setChecked(True)
+        self._chk_logq.setToolTip('Log or linear q axis for the partial I(q) and C-S plots.')
+        self._chk_logq.toggled.connect(self._update_log)
+        top.addWidget(self._chk_logq)
 
         self._chk_errbar = QCheckBox('Error bars')
         self._chk_errbar.setChecked(True)
@@ -847,24 +852,27 @@ class DecompositionTab(QWidget):
         # PlotCurveItem does not auto-apply log transform — we do it manually
         # so connect='finite' reliably creates gaps at nan (sign crossings).
         log_y = self._chk_log.isChecked()
-        lq = np.log10(q)   # x is always log
+        xq = self._xq(q)
 
-        # Always plot the 3 base partials (elem 0) with standard colors
-        # Negative values shown as dashed with |value| so sign is visible on log scale
-        for name, key_I, key_s in [
-            ('I_MM', 'I_MM', 's_MM'),
-            ('I_RM', 'I_RM', 's_RM'),
-            ('I_RR', 'I_RR', 's_RR'),
-        ]:
+        # Always plot the 3 base partials (elem 0) with standard colors.
+        # Log y: positive values solid; negative values drawn as |value|, dashed,
+        # with inverted-triangle markers.  Linear y: signed values as they are.
+        for name, key_I in [('I_MM', 'I_MM'), ('I_RM', 'I_RM'), ('I_RR', 'I_RR')]:
             Iq = r[key_I]
-            y_abs = np.maximum(np.abs(Iq), 1e-40)
-            pos = Iq >= 0
-            yv = np.log10(y_abs) if log_y else y_abs
-            # Mask negative values — gap in log plot signals sign flip
-            self._curves_iq[name].setData(lq, np.where(pos, yv, np.nan),
-                                          connect='finite')
-            self._curves_iq_neg[name].setData([], [])
-            self._neg_markers[name].setData([], [])
+            if log_y:
+                pos, neg = Iq > 0, Iq < 0
+                self._curves_iq[name].setData(
+                    xq, np.where(pos, np.log10(np.where(pos, Iq, 1.0)), np.nan),
+                    connect='finite')
+                self._curves_iq_neg[name].setData(
+                    xq, np.where(neg, np.log10(np.where(neg, -Iq, 1.0)), np.nan),
+                    connect='finite')
+                self._neg_markers[name].setData(
+                    x=xq[neg], y=np.log10(-Iq[neg]))
+            else:
+                self._curves_iq[name].setData(xq, Iq)
+                self._curves_iq_neg[name].setData([], [])
+                self._neg_markers[name].setData([], [])
 
         # Additional curves + error bars for N>1 elements (remove old ones first)
         for c in getattr(self, '_extra_iq_curves', []):
@@ -885,14 +893,24 @@ class DecompositionTab(QWidget):
                 Iq = mr['partials'][idx]
                 col = extra_colors[ec_idx % len(extra_colors)]
                 ec_idx += 1
-                y_abs = np.maximum(np.abs(Iq), 1e-40)
-                pos = Iq >= 0
-                yv = np.log10(y_abs) if log_y else y_abs
+                if log_y:
+                    pos, neg = Iq > 0, Iq < 0
+                    y_pos = np.where(pos, np.log10(np.where(pos, Iq, 1.0)), np.nan)
+                    y_neg = np.where(neg, np.log10(np.where(neg, -Iq, 1.0)), np.nan)
+                else:
+                    y_pos, y_neg = Iq, np.full_like(Iq, np.nan)
                 c_pos = pg.PlotCurveItem(
-                    lq, np.where(pos, yv, np.nan),
+                    xq, y_pos,
                     name=name, pen=pg.mkPen(col, width=2), connect='finite')
                 self._pw_iq.addItem(c_pos)
                 self._extra_iq_curves.append(c_pos)
+                if log_y and neg.any():
+                    c_neg = pg.PlotCurveItem(
+                        xq, y_neg, connect='finite',
+                        pen=pg.mkPen(col, width=1.5,
+                                     style=pg.QtCore.Qt.PenStyle.DashLine))
+                    self._pw_iq.addItem(c_neg)
+                    self._extra_iq_curves.append(c_neg)
                 ei = pg.ErrorBarItem(x=np.array([]), y=np.array([]),
                                      top=np.array([]), bottom=np.array([]),
                                      pen=pg.mkPen(col, width=0.8))
@@ -915,10 +933,10 @@ class DecompositionTab(QWidget):
             return
         ok  = cs <= 1.0
         vio = ~ok
-        lq  = np.log10(q)           # ScatterPlotItem lives in ViewBox (log10) coords
+        xq  = self._xq(q)           # ScatterPlotItem lives in ViewBox coords
         self._curve_cs.setData(q, cs)
-        self._pts_cs_ok.setData( x=lq[ok],  y=cs[ok])
-        self._pts_cs_vio.setData(x=lq[vio], y=cs[vio])
+        self._pts_cs_ok.setData( x=xq[ok],  y=cs[ok])
+        self._pts_cs_vio.setData(x=xq[vio], y=cs[vio])
 
     def _refresh_errorbars(self):
         if self._result is None:
@@ -927,6 +945,7 @@ class DecompositionTab(QWidget):
         q    = r['q']
         show = self._chk_errbar.isChecked()
         log  = self._chk_log.isChecked()
+        xq   = self._xq(q)
         # CS floor for I_RR: lower bar never goes below I_RM²/|I_MM|
         if not r.get('diff_mode', False):
             cs_floor = r['I_RM']**2 / np.maximum(np.abs(r['I_MM']), 1e-30)
@@ -950,22 +969,20 @@ class DecompositionTab(QWidget):
                 bot = si
 
             if show:
-                # Only plot where the bottom bar has positive extent AND value is positive
-                # (negative values are masked from the log plot, so hide their bars too).
-                ok = (bot > 0) & (raw_Iq >= 0)
                 if log:
                     # ErrorBarItem is a raw ViewBox item — needs log10 coords.
-                    # Also require Iq > bot so log10(Iq - bot) stays finite.
-                    ok_log = ok & (Iq > bot)
-                    lq  = np.log10(q[ok_log])
+                    # Bars are drawn around |value| (negative points are shown as
+                    # dashed |value|); require |I| > bot so log10(|I| - bot) is finite.
+                    ok_log = (bot > 0) & (Iq > bot)
                     lIq = np.log10(Iq[ok_log])
                     top    = np.log10(Iq[ok_log] + si[ok_log]) - lIq
                     bottom = lIq - np.log10(Iq[ok_log] - bot[ok_log])
                     self._err_items[name].setData(
-                        x=lq, y=lIq, top=top, bottom=bottom)
+                        x=xq[ok_log], y=lIq, top=top, bottom=bottom)
                 else:
+                    ok = si > 0
                     self._err_items[name].setData(
-                        x=q[ok], y=Iq[ok], top=si[ok], bottom=bot[ok])
+                        x=xq[ok], y=raw_Iq[ok], top=si[ok], bottom=si[ok])
             else:
                 self._err_items[name].setData(
                     x=np.array([]), y=np.array([]),
@@ -997,7 +1014,7 @@ class DecompositionTab(QWidget):
             else:
                 bot = si
 
-            ok = (bot > 0) & (raw_Iq >= 0)
+            ok = (bot > 0) if log else (si > 0)
             if not ok.any():
                 ei.setData(x=empty, y=empty, top=empty, bottom=empty)
                 continue
@@ -1008,16 +1025,22 @@ class DecompositionTab(QWidget):
                 if not ok_log.any():
                     ei.setData(x=empty, y=empty, top=empty, bottom=empty)
                     continue
-                lq_ok  = np.log10(q[ok_log])
+                lq_ok  = xq[ok_log]
                 lIq_ok = np.log10(Iq[ok_log])
                 top    = np.log10(Iq[ok_log] + si[ok_log]) - lIq_ok
                 bottom = lIq_ok - np.log10(Iq[ok_log] - bot[ok_log])
                 ei.setData(x=lq_ok, y=lIq_ok, top=top, bottom=bottom)
             else:
-                ei.setData(x=q[ok], y=Iq[ok], top=si[ok], bottom=bot[ok])
+                ei.setData(x=xq[ok], y=raw_Iq[ok], top=si[ok], bottom=si[ok])
 
-    def _update_log(self, log: bool):
-        self._pw_iq.setLogMode(x=True, y=log)
+    def _xq(self, q: np.ndarray) -> np.ndarray:
+        """x coordinates for raw ViewBox items: log10(q) in log-q mode, else q."""
+        return np.log10(q) if self._chk_logq.isChecked() else np.asarray(q)
+
+    def _update_log(self, _=None):
+        self._pw_iq.setLogMode(x=self._chk_logq.isChecked(),
+                               y=self._chk_log.isChecked())
+        self._pw_cs.setLogMode(x=self._chk_logq.isChecked(), y=False)
         if self._result is not None:
             self._update_iq_plot()   # PlotCurveItems need manual re-render on log toggle
         else:
@@ -1220,8 +1243,13 @@ class DecompositionTab(QWidget):
             # Local WLS solve on near-edge energies only
             A_loc = build_A(fp_m, fpp_m)
             w     = 1.0 / np.maximum(sig_m, 1e-30)
-            sol, *_ = lstsq(A_loc * w[:, None], I_marginal * w, rcond=None)
+            Aw = A_loc * w[:, None]
+            sol, *_ = lstsq(Aw, I_marginal * w, rcond=None)
             I_MM_j, I_RM_j, I_RR_j = sol
+            try:
+                loc_err = np.sqrt(np.maximum(np.diag(np.linalg.inv(Aw.T @ Aw)), 0))
+            except np.linalg.LinAlgError:
+                loc_err = np.full(3, np.nan)
 
             fp_dense  = np.linspace(fp_m.min() - 0.5, fp_m.max() + 0.5, 300)
             _sort     = np.argsort(fp_m)
@@ -1300,11 +1328,17 @@ class DecompositionTab(QWidget):
                 new_items.append(comp_c)
 
             self._stuhr_items_by_panel[panel_i] = new_items
-            lbl.setText(
-                f'q = {q_j:.4f} Å⁻¹  elem {panel_i+1}  |  '
-                f'I_MM = {I_MM_j:.4g}   '
-                f'I_RM = {I_RM_j:.4g}   '
-                f'I_RR = {I_RR_j:.4g}  cm⁻¹')
+            txt = (f'q = {q_j:.4f} Å⁻¹  elem {panel_i+1}  |  local fit '
+                   f'({int(mask.sum())}/{len(mask)} energies):  '
+                   f'I_MM = {I_MM_j:.4g}±{loc_err[0]:.2g}   '
+                   f'I_RM = {I_RM_j:.4g}±{loc_err[1]:.2g}   '
+                   f'I_RR = {I_RR_j:.4g}±{loc_err[2]:.2g}  cm⁻¹')
+            if I_RiM_g is not None and n_elems == 1:
+                txt += (f'\nglobal decomposition (all {len(mask)} energies):  '
+                        f"I_MM = {I_MM_g:.4g}±{r['s_MM'][ri]:.2g}   "
+                        f"I_RM = {I_RiM_g:.4g}±{r['s_RM'][ri]:.2g}   "
+                        f"I_RR = {I_RiRi_g:.4g}±{r['s_RR'][ri]:.2g}")
+            lbl.setText(txt)
 
     # ── Public API ────────────────────────────────────────────────────────────
     def set_data(self, q: np.ndarray, I_matrix: np.ndarray,
