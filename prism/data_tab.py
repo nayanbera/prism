@@ -56,6 +56,10 @@ class DataTab(QWidget):
         self._elem_lbl_edge:   list        = []
         self._elem_lbl_status: list        = []
         self._preset_maps: list[dict]      = [{}, {}, {}]
+        # Fluorescence background estimate (None until Estimate is pressed)
+        self._fluor: dict | None           = None
+        self._fluor_lines: list            = []   # (InfiniteLine, value)
+        self._fluor_q_touched              = False
         # Stuhrmann slice panels
         self._slice_panels: list           = []   # pg.PlotWidget per active elem
         self._slice_items:  list           = []   # list of lists of items
@@ -174,6 +178,35 @@ class DataTab(QWidget):
         qrow.addStretch()
         left_lay.addLayout(qrow)
 
+        frow = QHBoxLayout()
+        frow.addWidget(QLabel('Fluorescence bg q range:'))
+        self._fl_qmin = QDoubleSpinBox(); self._fl_qmin.setDecimals(5)
+        self._fl_qmin.setRange(0, 10); self._fl_qmin.setValue(0.1)
+        self._fl_qmax = QDoubleSpinBox(); self._fl_qmax.setDecimals(5)
+        self._fl_qmax.setRange(0, 10); self._fl_qmax.setValue(0.145)
+        for lbl, sp in [('from', self._fl_qmin), ('to', self._fl_qmax)]:
+            frow.addWidget(QLabel(lbl)); frow.addWidget(sp)
+        frow.addStretch()
+        left_lay.addLayout(frow)
+
+        frow2 = QHBoxLayout()
+        self._btn_fl_est = QPushButton('Estimate')
+        self._btn_fl_est.setToolTip(
+            'bb = mean I in the q range at the energy farthest from the edge(s).\n'
+            'be = mean I in the same q range at every energy.\n'
+            'Shown as dashed horizontal lines (bb in white).')
+        self._btn_fl_sub = QPushButton('Subtract')
+        self._btn_fl_sub.setToolTip(
+            'Subtract (be − bb) from every dataset; the corrected data replace\n'
+            'the plotted data and are used by all later tabs. Always computed\n'
+            'from the original data, so pressing it again does not double-subtract.')
+        self._lbl_fl = QLabel()
+        self._lbl_fl.setWordWrap(True)
+        frow2.addWidget(self._btn_fl_est)
+        frow2.addWidget(self._btn_fl_sub)
+        frow2.addWidget(self._lbl_fl, 1)
+        left_lay.addLayout(frow2)
+
         splitter.addWidget(left)
         splitter.setStretchFactor(0, 0)   # left panel: don't stretch
 
@@ -259,6 +292,10 @@ class DataTab(QWidget):
         self._table.itemChanged.connect(self._on_item_changed)
         self._table.currentItemChanged.connect(
             lambda cur, _: self._on_row_changed(cur.row() if cur else -1))
+        self._btn_fl_est.clicked.connect(self._fluor_estimate)
+        self._btn_fl_sub.clicked.connect(self._fluor_subtract)
+        self._fl_qmin.valueChanged.connect(self._on_fluor_q_changed)
+        self._fl_qmax.valueChanged.connect(self._on_fluor_q_changed)
         self._q_min.valueChanged.connect(self._update_slider_range)
         self._q_max.valueChanged.connect(self._update_slider_range)
         self._n_pts.valueChanged.connect(self._update_slider_range)
@@ -336,6 +373,113 @@ class DataTab(QWidget):
         self._pw.setLogMode(x=self._chk_logx.isChecked(),
                             y=self._chk_logy.isChecked())
         self._update_st_vline()
+        self._place_fluor_lines()
+
+    # ── Fluorescence background ───────────────────────────────────────────────
+    def _on_fluor_q_changed(self):
+        self._fluor_q_touched = True
+        self._clear_fluor()
+
+    def _clear_fluor(self):
+        for line, _ in self._fluor_lines:
+            self._pw.removeItem(line)
+        self._fluor_lines.clear()
+        self._fluor = None
+        self._lbl_fl.setText('')
+
+    def _place_fluor_lines(self):
+        """(Re)position dashed lines for the current log-y setting."""
+        logy = self._chk_logy.isChecked()
+        for line, val in self._fluor_lines:
+            ok = bool(val > 0 or not logy)
+            line.setVisible(ok)
+            if ok:
+                line.setPos(np.log10(val) if logy else val)
+
+    def _fluor_estimate(self) -> bool:
+        """Compute bb (farthest-from-edge energy) and be for every energy."""
+        from .anomalous_tab import _edge_energy_keV
+        self._clear_fluor()
+
+        edges = [_edge_energy_keV(self._elem_Z[i], self._elem_shell[i])
+                 for i in range(3)
+                 if self._elem_Z[i] and (i == 0 or self._elem_chk[i].isChecked())]
+        edges = [e for e in edges if e > 0]
+        if not edges:
+            self._lbl_fl.setText('Select a resonant element first.')
+            return False
+        q_lo, q_hi = sorted((self._fl_qmin.value(), self._fl_qmax.value()))
+
+        n = len(self._datasets)
+        be = np.full(n, np.nan)
+        for k, ds in enumerate(self._datasets):
+            if ds['energy'] is None:
+                continue
+            I = ds.get('I_raw', ds['I'])
+            m = (ds['q'] >= q_lo) & (ds['q'] <= q_hi)
+            if m.any():
+                be[k] = float(np.mean(I[m]))
+
+        # Base: active dataset whose energy is farthest from the nearest edge
+        cand = [k for k, d in enumerate(self._datasets)
+                if d.get('active', True) and not np.isnan(be[k])]
+        if not cand:
+            self._lbl_fl.setText(
+                f'No active dataset has data in q = {q_lo:g}–{q_hi:g} Å⁻¹.')
+            return False
+        dist = lambda k: min(abs(self._datasets[k]['energy'] - e) for e in edges)
+        base = max(cand, key=dist)
+        bb = be[base]
+
+        self._fluor = dict(base=base, bb=bb, be=be, q_range=(q_lo, q_hi))
+        pen_w = pg.mkPen('#ffffff', width=2, style=Qt.PenStyle.DashLine)
+        for k in range(n):
+            if np.isnan(be[k]):
+                continue
+            if k == base:
+                pen, val = pen_w, bb
+            else:
+                c = self._curves[k].opts['pen'].color()
+                pen, val = pg.mkPen(c, width=1, style=Qt.PenStyle.DashLine), be[k]
+            line = pg.InfiniteLine(angle=0, movable=False, pen=pen)
+            self._pw.addItem(line)
+            self._fluor_lines.append((line, val))
+        self._place_fluor_lines()
+
+        missing = int(np.isnan(be).sum())
+        self._lbl_fl.setText(
+            f"bb = {bb:.4g} at {self._datasets[base]['energy']:.4f} keV; "
+            f"be − bb: {np.nanmin(be - bb):.3g} … {np.nanmax(be - bb):.3g}"
+            + (f'  ({missing} dataset(s) skipped: no data in q range)'
+               if missing else ''))
+        return True
+
+    def _fluor_subtract(self):
+        """Replace I with I_raw − (be − bb) for every dataset (idempotent)."""
+        if not self._datasets:
+            return
+        if self._fluor is None and not self._fluor_estimate():
+            return
+        f = self._fluor
+        shift = f['be'] - f['bb']
+        n_neg = 0
+        self._table.blockSignals(True)
+        for k, ds in enumerate(self._datasets):
+            if np.isnan(shift[k]):
+                continue
+            ds.setdefault('I_raw', ds['I'].copy())
+            ds['I'] = ds['I_raw'] - shift[k]
+            ds['fluor_shift'] = float(shift[k])
+            n_neg += int(np.sum(ds['I'] <= 0))
+            m = ds['I'] > 0
+            self._curves[k].setData(ds['q'][m], ds['I'][m])
+            snr = float(np.median(ds['sigma'] / np.maximum(ds['I'], 1e-30)))
+            self._table.item(k, self._COL_SNR).setText(f'{snr:.3f}')
+        self._table.blockSignals(False)
+        self._lbl_fl.setText(
+            self._lbl_fl.text() + '\nSubtracted.'
+            + (f' {n_neg} point(s) ≤ 0 are hidden on the log plot.' if n_neg else ''))
+        self._emit_active()
 
     # ── Stuhrmann slice ───────────────────────────────────────────────────────
     def _q_grid(self) -> np.ndarray | None:
@@ -868,6 +1012,7 @@ class DataTab(QWidget):
         for c in self._curves:
             self._pw.removeItem(c)
         self._curves.clear()
+        self._clear_fluor()
 
         total = len(self._datasets)
         for i, ds in enumerate(self._datasets):
@@ -891,6 +1036,11 @@ class DataTab(QWidget):
             self._q_max.setValue(q_hi)
             for sp in (self._q_min, self._q_max, self._n_pts):
                 sp.blockSignals(False)
+            if not self._fluor_q_touched:
+                self._fl_qmin.blockSignals(True); self._fl_qmax.blockSignals(True)
+                self._fl_qmin.setValue(q_lo + 0.8 * (q_hi - q_lo))
+                self._fl_qmax.setValue(q_hi)
+                self._fl_qmin.blockSignals(False); self._fl_qmax.blockSignals(False)
 
         self._emit_active()
 
