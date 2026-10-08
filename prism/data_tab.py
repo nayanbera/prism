@@ -75,6 +75,10 @@ class DataTab(QWidget):
         self._btn_add       = QPushButton('Add files…')
         self._btn_remove    = QPushButton('Remove selected')
         self._btn_clear     = QPushButton('Clear all')
+        self._btn_sel_all   = QPushButton('Select all')
+        self._btn_sel_all.setToolTip("Tick the 'Use' box of every dataset.")
+        self._btn_desel_all = QPushButton('Deselect all')
+        self._btn_desel_all.setToolTip("Untick the 'Use' box of every dataset.")
         self._btn_save_list = QPushButton('Save list…')
         self._btn_save_list.setToolTip(
             'Save the current file list (paths, energies, element selections)\n'
@@ -85,6 +89,7 @@ class DataTab(QWidget):
             'and restores element selections and q-grid settings.')
         self._lbl_status = QLabel()
         for w in (self._btn_add, self._btn_remove, self._btn_clear,
+                  self._btn_sel_all, self._btn_desel_all,
                   self._btn_save_list, self._btn_load_list, self._lbl_status):
             btn_row.addWidget(w)
         btn_row.addStretch()
@@ -287,6 +292,8 @@ class DataTab(QWidget):
         self._btn_add.clicked.connect(self._add_files)
         self._btn_remove.clicked.connect(self._remove_selected)
         self._btn_clear.clicked.connect(self._clear)
+        self._btn_sel_all.clicked.connect(lambda: self._set_all_active(True))
+        self._btn_desel_all.clicked.connect(lambda: self._set_all_active(False))
         self._btn_save_list.clicked.connect(self._save_filelist)
         self._btn_load_list.clicked.connect(self._load_filelist)
         self._table.itemChanged.connect(self._on_item_changed)
@@ -320,12 +327,31 @@ class DataTab(QWidget):
     def _remove_selected(self):
         rows = sorted({idx.row() for idx in self._table.selectedIndexes()},
                       reverse=True)
+        if not rows:
+            QMessageBox.information(
+                self, 'Nothing selected',
+                'Click a row in the table to select it (Ctrl/Shift-click for '
+                'several), then press Remove selected.')
+            return
         for r in rows:
             self._table.removeRow(r)
             curve = self._curves.pop(r)
             self._pw.removeItem(curve)
             self._datasets.pop(r)
         self._sort_and_emit()
+
+    def _set_all_active(self, checked: bool):
+        """Tick/untick the Use box of every dataset (one downstream update)."""
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        self._table.blockSignals(True)
+        for r, ds in enumerate(self._datasets):
+            ds['active'] = checked
+            self._table.item(r, self._COL_USE).setCheckState(state)
+            if r < len(self._curves):
+                self._curves[r].setVisible(checked)
+                self._curves[r].setOpacity(1.0 if checked else 0.25)
+        self._table.blockSignals(False)
+        self._emit_active()
 
     def _clear(self):
         self._table.setRowCount(0)
@@ -842,7 +868,8 @@ class DataTab(QWidget):
 
         # ✓ checkbox
         chk = QTableWidgetItem()
-        chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+        chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
+                     | Qt.ItemFlag.ItemIsSelectable)
         chk.setCheckState(
             Qt.CheckState.Checked if ds.get('active', True) else Qt.CheckState.Unchecked)
         self._table.setItem(r, self._COL_USE, chk)
