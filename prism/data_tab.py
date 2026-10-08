@@ -205,10 +205,19 @@ class DataTab(QWidget):
             'Subtract (be − bb) from every dataset; the corrected data replace\n'
             'the plotted data and are used by all later tabs. Always computed\n'
             'from the original data, so pressing it again does not double-subtract.')
+        self._chk_fl_use = QCheckBox('Use subtracted')
+        self._chk_fl_use.setChecked(True)
+        self._chk_fl_use.setEnabled(False)
+        self._chk_fl_use.setToolTip(
+            'Untick to switch every dataset back to the original data (without\n'
+            'fluorescence subtraction) for plots and later tabs; tick to switch\n'
+            'back. Enabled once Subtract has been applied. Re-run the analysis\n'
+            'tabs after toggling.')
         self._lbl_fl = QLabel()
         self._lbl_fl.setWordWrap(True)
         frow2.addWidget(self._btn_fl_est)
         frow2.addWidget(self._btn_fl_sub)
+        frow2.addWidget(self._chk_fl_use)
         frow2.addWidget(self._lbl_fl, 1)
         left_lay.addLayout(frow2)
 
@@ -301,6 +310,7 @@ class DataTab(QWidget):
             lambda cur, _: self._on_row_changed(cur.row() if cur else -1))
         self._btn_fl_est.clicked.connect(self._fluor_estimate)
         self._btn_fl_sub.clicked.connect(self._fluor_subtract)
+        self._chk_fl_use.toggled.connect(self._fluor_use_toggled)
         self._fl_qmin.valueChanged.connect(self._on_fluor_q_changed)
         self._fl_qmax.valueChanged.connect(self._on_fluor_q_changed)
         self._q_min.valueChanged.connect(self._update_slider_range)
@@ -488,24 +498,44 @@ class DataTab(QWidget):
             return
         f = self._fluor
         shift = f['be'] - f['bb']
-        n_neg = 0
-        self._table.blockSignals(True)
         for k, ds in enumerate(self._datasets):
             if np.isnan(shift[k]):
                 continue
             ds.setdefault('I_raw', ds['I'].copy())
-            ds['I'] = ds['I_raw'] - shift[k]
+            ds['I_sub'] = ds['I_raw'] - shift[k]
             ds['fluor_shift'] = float(shift[k])
+        self._chk_fl_use.blockSignals(True)
+        self._chk_fl_use.setChecked(True)
+        self._chk_fl_use.blockSignals(False)
+        self._chk_fl_use.setEnabled(True)
+        n_neg = self._apply_fluor_choice()
+        self._lbl_fl.setText(
+            self._lbl_fl.text() + '\nSubtracted.'
+            + (f' {n_neg} point(s) ≤ 0 are hidden on the log plot.' if n_neg else ''))
+
+    def _fluor_use_toggled(self, use_sub: bool):
+        self._apply_fluor_choice()
+        self._lbl_fl.setText('Using subtracted data.' if use_sub
+                             else 'Using ORIGINAL data (no fluorescence subtraction).')
+
+    def _apply_fluor_choice(self) -> int:
+        """Point every dataset's I at I_sub or I_raw per the checkbox, refresh
+        plot/table and notify later tabs. Returns the number of I ≤ 0 points."""
+        use_sub = self._chk_fl_use.isChecked()
+        n_neg = 0
+        self._table.blockSignals(True)
+        for k, ds in enumerate(self._datasets):
+            if 'I_sub' not in ds:
+                continue
+            ds['I'] = ds['I_sub'] if use_sub else ds['I_raw']
             n_neg += int(np.sum(ds['I'] <= 0))
             m = ds['I'] > 0
             self._curves[k].setData(ds['q'][m], ds['I'][m])
             snr = float(np.median(ds['sigma'] / np.maximum(ds['I'], 1e-30)))
             self._table.item(k, self._COL_SNR).setText(f'{snr:.3f}')
         self._table.blockSignals(False)
-        self._lbl_fl.setText(
-            self._lbl_fl.text() + '\nSubtracted.'
-            + (f' {n_neg} point(s) ≤ 0 are hidden on the log plot.' if n_neg else ''))
         self._emit_active()
+        return n_neg
 
     # ── Stuhrmann slice ───────────────────────────────────────────────────────
     def _q_grid(self) -> np.ndarray | None:
@@ -1040,6 +1070,7 @@ class DataTab(QWidget):
             self._pw.removeItem(c)
         self._curves.clear()
         self._clear_fluor()
+        self._chk_fl_use.setEnabled(any('I_sub' in d for d in self._datasets))
 
         total = len(self._datasets)
         for i, ds in enumerate(self._datasets):
